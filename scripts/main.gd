@@ -40,6 +40,9 @@ var _vis_container:  Node3D
 var _simulator: PhysicalBoneSimulator3D
 ## bone_id (int) → PhysicalBone3D — built once, shared with vis_driver.
 var _phys_bone_map: Dictionary = {}
+## Ordered list of target bones for ball cycling.
+var _ball_targets: Array[PhysicalBone3D] = []
+var _shot_count: int = 0
 
 # ---------------------------------------------------------------------------
 # Animation
@@ -106,17 +109,41 @@ func _ready() -> void:
 	_phys_skeleton = _find_skeleton(phys_root)
 	_hide_meshes(phys_root)
 	_create_physical_bones(_phys_skeleton)
-	# Build bone_id → PhysicalBone3D map so the vis_driver can read physics
-	# body world transforms directly (bypasses PhysicalBoneSimulator3D write-back).
+
+	# Build bone_id → PhysicalBone3D map FIRST so the simulation check and
+	# force-RIGID fallback below can use it.
 	_build_phys_bone_map(_phys_skeleton)
-	print("[main] Bone map: %d entries." % _phys_bone_map.size())
+	_build_ball_targets()
+	print("[main] Bone map: %d entries, %d targets." % [_phys_bone_map.size(), _ball_targets.size()])
+
+	# PhysicalBone3D bodies need at least one physics frame to register with the server.
+	await get_tree().physics_frame
+	_simulator.active = true
+	# Call start_simulation on the simulator directly — more reliable than going via Skeleton3D.
+	_simulator.physical_bones_start_simulation()
+	# PhysicalBoneSimulator3D is a SkeletonModifier3D — it runs _process_modification()
+	# during the skeleton's process step, NOT the physics step.  Wait one process frame
+	# so the modifier fires and actually flips the bones to dynamic mode, then a physics
+	# frame so the PhysicsServer registers the new body mode before we query it.
+	await get_tree().process_frame
+	await get_tree().physics_frame
+	await get_tree().physics_frame
+
+	# Diagnostic: print the actual PhysicsServer3D body mode (0=Static,1=Kinematic,2=Rigid).
+	if not _phys_bone_map.is_empty():
+		var first_pb: PhysicalBone3D = _phys_bone_map.values()[0] as PhysicalBone3D
+		var mode := PhysicsServer3D.body_get_mode(first_pb.get_rid())
+		print("[main] Simulator active: %s  — bones: %d  — first bone mode: %d  — simulating: %s" % [
+			_simulator.active, _phys_bone_map.size(), mode, first_pb.is_simulating_physics()])
+	else:
+		print("[main] Simulator active: %s  — bone map EMPTY" % _simulator.active)
 
 	# Create driver BEFORE add_child so _ready() sees valid references.
 	_phys_driver = Node3D.new()
 	_phys_driver.name = "PhysDriver"
 	_phys_driver.set_script(load("res://scripts/physical_animation.gd"))
-	_phys_driver.set("skeleton",        _phys_skeleton)
 	_phys_driver.set("target_skeleton", _anim_skeleton)
+	_phys_driver.set("phys_body_map",   _phys_bone_map)
 	_phys_driver.set("spring_enabled",  true)
 	phys_root.add_child(_phys_driver)
 	print("[main] PhysicsRig ready.")
@@ -131,7 +158,7 @@ func _ready() -> void:
 	_vis_driver.set("visual_skeleton",   _vis_skeleton)
 	_vis_driver.set("physics_skeleton",  _phys_skeleton)
 	_vis_driver.set("animated_skeleton", _anim_skeleton)
-	_vis_driver.set("physics_blend",     0.0)
+	_vis_driver.set("physics_blend",     0.0)   # animation drives visual until physics is confirmed
 	_vis_driver.set("phys_bone_map",     _phys_bone_map)
 	vis_root.add_child(_vis_driver)
 	print("[main] VisualRig ready.")
@@ -170,7 +197,7 @@ func _handle_movement(delta: float) -> void:
 	if Input.is_key_pressed(KEY_S): fwd_input -= 1.0   # S = move backward
 
 	if fwd_input != 0.0:
-		# Character's local forward is -Z; rotate by yaw to get world forward.
+		# Character faces -Z; rotate by yaw to get world forward.
 		var forward := Basis(Vector3.UP, _char_yaw) * Vector3(0.0, 0.0, -1.0)
 		_char_pos += forward * fwd_input * MOVE_SPEED * delta
 		_char_pos.y = 0.1   # stay on floor
@@ -186,7 +213,7 @@ func _update_containers() -> void:
 func _update_camera(delta: float) -> void:
 	if _camera == null:
 		return
-	# Back direction in world space (camera sits behind character, which faces -Z).
+	# Back direction in world space (character faces -Z, so back is +Z).
 	var back := Basis(Vector3.UP, _char_yaw) * Vector3(0.0, 0.0, 1.0)
 	var cam_target := _char_pos + back * CAM_DIST + Vector3(0.0, CAM_HEIGHT, 0.0)
 	var t := minf(CAM_LERP * delta, 1.0)
@@ -233,24 +260,76 @@ func _set_ragdoll_mode(mode: RagdollMode) -> void:
 	_mode = mode
 	match mode:
 		RagdollMode.ANIMATED:
-			_set_limp_joints(false)   # restore joint limits before springs re-engage
-			if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", true)
-			if is_instance_valid(_vis_driver):  _vis_driver.call("blend_to_animation", 0.5)
+			_set_limp_joints(false)
+			# Visual goes back to animation-driven (no dependency on physics bone state).
+			if is_instance_valid(_vis_driver): _vis_driver.set("physics_blend", 0.0)
+			# Resume animation and let locomotion system pick the right clip.
+			_loco_state = ""
+			if is_instance_valid(_anim_player):
+				var key := _anim_idle if not _anim_idle.is_empty() \
+						else (_anim_keys[0] if not _anim_keys.is_empty() else "")
+				if not key.is_empty():
+					_anim_player.play(key)
+			# Restart simulation so 6DOF joints rebuild, then re-enable springs.
+			_go_animated_async()
 			print("[main] Mode: Animated")
 		RagdollMode.ACTIVE:
-			# Springs ON — physics bones follow animation but react to impacts.
 			_set_limp_joints(false)
 			if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", true)
-			if is_instance_valid(_vis_driver):  _vis_driver.call("blend_to_ragdoll", 0.3)
+			if is_instance_valid(_vis_driver):  _vis_driver.set("physics_blend", 1.0)
 			print("[main] Mode: Active Ragdoll (G to exit)")
 		RagdollMode.LIMP:
-			# Unlock joints first so gravity can fully collapse the character,
-			# THEN disable springs and blend to physics view.
-			_set_limp_joints(true)
 			if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", false)
-			if is_instance_valid(_vis_driver):  _vis_driver.call("blend_to_ragdoll", 0.15)
-			_kick_limp_bones()
+			if is_instance_valid(_vis_driver):  _vis_driver.set("physics_blend", 1.0)
+			# Stop animation — springs are off so animated skeleton no longer matters,
+			# but halting it avoids any stray modifier influence.
+			if is_instance_valid(_anim_player): _anim_player.pause()
+			_loco_state = ""
+			_set_limp_joints(true)
+			# Restart simulation asynchronously so JOINT_TYPE_NONE is registered
+			# in the physics server, then force RIGID and kick all bones downward.
+			_go_limp_async()
 			print("[main] Mode: Limp Ragdoll (P to exit)")
+
+
+func _go_limp_async() -> void:
+	# Joint-type property changes are only applied to the physics server when
+	# the simulation is stopped and restarted — do that on the simulator directly.
+	_simulator.physical_bones_stop_simulation()
+	await get_tree().physics_frame
+	if _mode != RagdollMode.LIMP:
+		return
+	_simulator.physical_bones_start_simulation()
+	await get_tree().physics_frame
+	await get_tree().physics_frame
+	if _mode != RagdollMode.LIMP:
+		return
+	# Verify and report body modes so we can tell if simulation actually started.
+	var rigid_count := 0
+	for id: int in _phys_bone_map:
+		var pb: PhysicalBone3D = _phys_bone_map[id]
+		if is_instance_valid(pb) and pb.get_rid().is_valid():
+			var m := PhysicsServer3D.body_get_mode(pb.get_rid())
+			if m == PhysicsServer3D.BODY_MODE_RIGID:
+				rigid_count += 1
+	print("[main] Limp: %d/%d bones in RIGID mode — kicking." % [rigid_count, _phys_bone_map.size()])
+	_kick_limp_bones()
+
+
+func _go_animated_async() -> void:
+	# Keep springs off until joints have been rebuilt.
+	if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", false)
+	_simulator.physical_bones_stop_simulation()
+	await get_tree().physics_frame
+	if _mode != RagdollMode.ANIMATED:
+		return
+	_simulator.physical_bones_start_simulation()
+	await get_tree().physics_frame
+	await get_tree().physics_frame
+	if _mode != RagdollMode.ANIMATED:
+		return
+	if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", true)
+	print("[main] Animated: joints rebuilt, springs active.")
 
 
 # ---------------------------------------------------------------------------
@@ -275,35 +354,55 @@ func _shoot_ball() -> void:
 	if _camera == null:
 		return
 
+	# Each shot targets the next body part in the cycle.
+	var target_pos: Vector3
+	var target_name: String = "chest"
+	if not _ball_targets.is_empty():
+		var target_bone: PhysicalBone3D = _ball_targets[_shot_count % _ball_targets.size()]
+		if is_instance_valid(target_bone):
+			target_pos  = target_bone.global_position
+			target_name = target_bone.name
+		else:
+			target_pos = _char_pos + Vector3(0.0, 1.0, 0.0)
+	else:
+		target_pos = _char_pos + Vector3(0.0, 1.0, 0.0)
+
+	# Mass grows with each shot (1, 2, 3 … capped at 20).
+	var mass   := minf(1.0 + _shot_count, 20.0)
+	var radius := 0.08 + sqrt(mass) * 0.035   # visually larger as mass rises
+
+	_shot_count += 1
+	print("[main] Shot %d → %s  mass=%.1f  r=%.2f" % [_shot_count, target_name, mass, radius])
+
 	var ball := RigidBody3D.new()
-	ball.name = "Ball"
-	ball.contact_monitor = true
+	ball.name  = "Ball"
+	ball.mass  = mass
+	ball.contact_monitor      = true
 	ball.max_contacts_reported = 8
 
 	var sphere := SphereShape3D.new()
-	sphere.radius = 0.12
+	sphere.radius = radius
 	var col := CollisionShape3D.new()
 	col.shape = sphere
 	ball.add_child(col)
 
-	var sm  := SphereMesh.new()
-	sm.radius = 0.12
-	sm.height = 0.24
+	var sm := SphereMesh.new()
+	sm.radius = radius
+	sm.height  = radius * 2.0
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(1.0, 0.35, 0.05)
+	# Orange → dark red as mass increases.
+	var t   := clampf((_shot_count - 1) / 19.0, 0.0, 1.0)
+	mat.albedo_color = Color(1.0 - t * 0.5, 0.35 - t * 0.3, 0.05, 1.0)
 	sm.surface_set_material(0, mat)
 	var mi := MeshInstance3D.new()
 	mi.mesh = sm
 	ball.add_child(mi)
 
-	# Add to scene first — global_position requires being in the tree.
 	add_child(ball)
 	var cam_fwd   := -_camera.global_transform.basis.z
 	var spawn_pos := _camera.global_position + cam_fwd * 1.5
-	ball.global_position = spawn_pos
-
-	var chest := _char_pos + Vector3(0.0, 1.0, 0.0)
-	ball.linear_velocity = (chest - spawn_pos).normalized() * 18.0
+	ball.global_position  = spawn_pos
+	ball.linear_velocity  = (target_pos - spawn_pos).normalized() * 18.0
 
 	var ball_ref: WeakRef = weakref(ball)
 	ball.body_entered.connect(func(body: Node3D):
@@ -323,10 +422,13 @@ func _on_ball_hit(body: Node3D, ball: RigidBody3D) -> void:
 	print("[main] Ball hit: %s" % body.name)
 	ball.collision_layer = 0
 	ball.collision_mask  = 0
-	# Add ball velocity directly to the struck bone — more reliable on PhysicalBone3D
-	# than apply_central_impulse, which requires the simulation to be fully awake.
-	var bone := body as PhysicalBone3D
-	bone.linear_velocity += ball.linear_velocity * 0.6
+	var pb := body as PhysicalBone3D
+	var impulse := ball.linear_velocity * 0.6
+	# apply_impulse at an offset creates both linear and angular response.
+	# The 0.15 m Y offset means the force acts above the bone centre,
+	# producing a natural rotation around the joint even when translation
+	# is constrained by the 6DOF joint.
+	pb.apply_impulse(impulse, Vector3(0.0, 0.15, 0.0))
 	_trigger_knockback()
 
 
@@ -337,30 +439,23 @@ func _trigger_knockback() -> void:
 
 	# Disable springs so the physics bones react to the impact instead of
 	# being immediately snapped back by the spring forces.
+	# physics_blend is always 1.0 so the visual responds immediately.
 	if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", false)
-	if is_instance_valid(_vis_driver):  _vis_driver.call("blend_to_ragdoll", 0.05)
 
 	get_tree().create_timer(1.8).timeout.connect(_recover_knockback)
 
 
 func _kick_limp_bones() -> void:
-	# Give every physical bone a small random velocity so they overcome static
-	# damping and fall under gravity immediately when springs are disabled.
-	if not is_instance_valid(_phys_skeleton):
-		return
-	_apply_bone_kick(_phys_skeleton)
-
-
-func _apply_bone_kick(node: Node) -> void:
-	if node is PhysicalBone3D:
-		var pb := node as PhysicalBone3D
-		# Strong downward velocity so the collapse is immediate and obvious.
-		pb.linear_velocity = Vector3(
-				randf_range(-1.5, 1.5),
-				randf_range(-6.0, -3.0),
-				randf_range(-1.5, 1.5))
-	for c in node.get_children():
-		_apply_bone_kick(c)
+	# Apply a downward impulse via PhysicsServer3D directly — this is guaranteed
+	# to work on any RIGID body regardless of property-setter caching.
+	for id: int in _phys_bone_map:
+		var pb: PhysicalBone3D = _phys_bone_map[id]
+		if is_instance_valid(pb) and pb.get_rid().is_valid():
+			var impulse := Vector3(
+					randf_range(-1.5, 1.5),
+					randf_range(-8.0, -5.0),   # strong downward kick
+					randf_range(-1.5, 1.5))
+			PhysicsServer3D.body_apply_central_impulse(pb.get_rid(), impulse)
 
 
 func _recover_knockback() -> void:
@@ -368,7 +463,6 @@ func _recover_knockback() -> void:
 	if _mode != RagdollMode.ANIMATED:
 		return   # user switched to a manual ragdoll mode — don't auto-recover
 	if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", true)
-	if is_instance_valid(_vis_driver):  _vis_driver.call("blend_to_animation", 0.6)
 
 
 # ---------------------------------------------------------------------------
@@ -376,22 +470,25 @@ func _recover_knockback() -> void:
 # ---------------------------------------------------------------------------
 
 func _set_limp_joints(limp: bool) -> void:
-	if is_instance_valid(_phys_skeleton):
-		_walk_bone_joints(_phys_skeleton, limp)
-
-
-func _walk_bone_joints(node: Node, limp: bool) -> void:
-	if node is PhysicalBone3D:
-		var pb := node as PhysicalBone3D
-		# Unlock all rotation axes so the character can fully collapse.
-		pb.set("joint/angular_limit_x/enabled", not limp)
-		pb.set("joint/angular_limit_y/enabled", not limp)
-		pb.set("joint/angular_limit_z/enabled", not limp)
-		# Very low damping so gravity takes effect immediately.
-		pb.linear_damp  = 0.05 if limp else 0.8
-		pb.angular_damp = 0.05 if limp else 0.8
-	for c in node.get_children():
-		_walk_bone_joints(c, limp)
+	if not is_instance_valid(_phys_skeleton):
+		return
+	for id: int in _phys_bone_map:
+		var pb: PhysicalBone3D = _phys_bone_map[id]
+		if not is_instance_valid(pb):
+			continue
+		if limp:
+			# Remove ALL joint constraints so every bone falls freely under gravity.
+			# (The physics server only applies these changes after stop/start — see
+			# _go_limp_async which restarts the simulation immediately after.)
+			pb.joint_type   = PhysicalBone3D.JOINT_TYPE_NONE
+			pb.linear_damp  = 0.05
+			pb.angular_damp = 0.05
+		else:
+			# Restore constrained 6DOF joint for spring-driven animation.
+			pb.joint_type   = PhysicalBone3D.JOINT_TYPE_6DOF
+			pb.linear_damp  = 0.8
+			pb.angular_damp = 0.8
+			_apply_joint_limits(pb, _phys_skeleton.get_bone_name(id))
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +556,29 @@ func _make_rig(rig_name: String, scene: PackedScene) -> Node:
 	inst.name = "Character"
 	container.add_child(inst)
 	return inst
+
+
+func _build_ball_targets() -> void:
+	# Ordered list of body-part name fragments, head → feet.
+	var priority: Array[String] = [
+		"head", "neck", "spine2", "spine1", "spine",
+		"rightarm", "leftarm", "rightforearm", "leftforearm",
+		"righthand", "lefthand",
+		"rightupleg", "leftupleg", "rightleg", "leftleg",
+		"rightfoot", "leftfoot", "hips",
+	]
+	_ball_targets.clear()
+	for frag in priority:
+		for id: int in _phys_bone_map:
+			var pb: PhysicalBone3D = _phys_bone_map[id]
+			if frag in pb.name.to_lower() and not _ball_targets.has(pb):
+				_ball_targets.append(pb)
+				break
+	# Append any remaining physical bones not yet covered.
+	for id: int in _phys_bone_map:
+		var pb: PhysicalBone3D = _phys_bone_map[id]
+		if not _ball_targets.has(pb):
+			_ball_targets.append(pb)
 
 
 func _build_phys_bone_map(node: Node) -> void:
@@ -557,7 +677,9 @@ func _setup_animation_player(character_root: Node) -> void:
 				# Key = FBX base name without extension, spaces preserved for readability.
 				var key: StringName = StringName(fbx_name.get_basename())
 				if not lib.has_animation(key):
-					lib.add_animation(key, anim.duplicate(true))
+					var anim_copy: Animation = anim.duplicate(true)
+					anim_copy.loop_mode = Animation.LOOP_LINEAR
+					lib.add_animation(key, anim_copy)
 					loaded += 1
 				if not sample_printed:
 					sample_printed = true
@@ -643,7 +765,8 @@ func _create_physical_bones(skeleton: Skeleton3D) -> void:
 		created += 1
 
 	print("[main] Created %d physical bones." % created)
-	skeleton.physical_bones_start_simulation()
+	# Do NOT start simulation here — the physics engine hasn't processed these
+	# bodies yet.  Activation is deferred to _ready() after a physics frame.
 
 
 func _skip_bone(bone_name: String) -> bool:

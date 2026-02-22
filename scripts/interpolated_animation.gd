@@ -56,11 +56,10 @@ func _process(_delta: float) -> void:
 					phys_xform = pb.global_transform
 				else:
 					phys_xform = anim_xform
-			elif is_instance_valid(physics_skeleton):
-				# Fallback for skipped bones (fingers, toes, etc.)
-				phys_xform = physics_skeleton.global_transform \
-						* physics_skeleton.get_bone_global_pose(i)
 			else:
+				# Fallback for skipped bones (fingers, toes, etc.) — use the
+				# animated pose so they follow the animation rather than the
+				# undriven physics skeleton (which is always in T-pose).
 				phys_xform = anim_xform
 			blended_local = inv_skel * anim_xform.interpolate_with(phys_xform, physics_blend)
 

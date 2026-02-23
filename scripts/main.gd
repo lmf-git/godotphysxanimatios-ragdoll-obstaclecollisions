@@ -208,10 +208,10 @@ func _ready() -> void:
 	_char_body.collision_mask  = 1   # detects layer-1 static geometry
 	var cap := CapsuleShape3D.new()
 	cap.radius = 0.35
-	cap.height = 1.7
+	cap.height = 0.9   # covers legs/hips only — upper body reacts to ledge via physics bones
 	var cap_col := CollisionShape3D.new()
 	cap_col.shape = cap
-	cap_col.position = Vector3(0.0, 0.85, 0.0)
+	cap_col.position = Vector3(0.0, 0.45, 0.0)
 	_char_body.add_child(cap_col)
 	add_child(_char_body)
 	_char_body.global_position = _char_pos
@@ -541,6 +541,10 @@ func _shoot_ball() -> void:
 	ball.mass  = mass
 	ball.contact_monitor      = true
 	ball.max_contacts_reported = 8
+	# Same layer as physics bones so ball↔bone collision fires body_entered.
+	# Mask 5 = layer 1 (ledge) + layer 4 (bones) so balls also bounce off walls.
+	ball.collision_layer = 4
+	ball.collision_mask  = 5
 
 	var sphere := SphereShape3D.new()
 	sphere.radius = radius
@@ -1006,6 +1010,11 @@ func _create_physical_bones(skeleton: Skeleton3D) -> void:
 		pb.linear_damp  = 0.8
 		pb.angular_damp = 0.8
 		pb.bone_name = bone_name   # MUST be set before add_child
+		# Layer 4 — separate from static geometry (layer 1) so the CharacterBody3D
+		# capsule (mask 1) never collides with physics bones via move_and_slide.
+		# Mask 5 = layer 1 (ledge/walls) + layer 4 (other bones, balls).
+		pb.collision_layer = 4
+		pb.collision_mask  = 5
 
 		pb.add_child(col)
 		simulator.add_child(pb)

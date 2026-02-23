@@ -58,8 +58,23 @@ func _process(_delta: float) -> void:
 				else:
 					phys_xform = anim_xform
 			else:
-				# Non-physics bones (fingers, toes) follow the animation.
-				phys_xform = anim_xform
+				# Walk up parent chain to the nearest physics ancestor so fingers/toes
+				# move with their physics parent rather than snapping to animated pose.
+				var par := visual_skeleton.get_bone_parent(i)
+				while par >= 0 and not phys_bone_map.has(par):
+					par = visual_skeleton.get_bone_parent(par)
+				if par >= 0:
+					var phys_par: PhysicalBone3D = phys_bone_map[par]
+					if is_instance_valid(phys_par):
+						var anim_par_xform: Transform3D = (
+							animated_skeleton.global_transform
+							* animated_skeleton.get_bone_global_pose(par))
+						var local_to_par := anim_par_xform.affine_inverse() * anim_xform
+						phys_xform = phys_par.global_transform * local_to_par
+					else:
+						phys_xform = anim_xform
+				else:
+					phys_xform = anim_xform
 			blended_local = inv_skel * anim_xform.interpolate_with(phys_xform, physics_blend)
 
 		visual_skeleton.set_bone_global_pose_override(i, blended_local, 1.0, true)

@@ -13,20 +13,21 @@ const SKIP_BONE_FRAGMENTS: Array[String] = [
 ]
 
 const BONE_LIMITS: Dictionary = {
-	# Hips / spine — tighter than before so the ragdoll can't fold in on itself.
-	"hips":     Vector3(35,  35,  40),
-	"spine":    Vector3(20,  20,  22),
-	"neck":     Vector3(45,  45,  35),
-	"head":     Vector3(45,  45,  35),
+	# Hips / spine — tight so the ragdoll can't fold in on itself.
+	"hips":     Vector3(20,  20,  22),
+	"spine":    Vector3(15,  15,  15),
+	"neck":     Vector3(40,  40,  30),
+	"head":     Vector3(40,  40,  30),
 	# Shoulder / arm — generous ball-socket range for natural animation.
 	"shoulder": Vector3(65,  65,  65),
 	"arm":      Vector3(95,  95,  95),
-	"forearm":  Vector3(5,  150,   5),
-	"hand":     Vector3(50,  50,  50),
-	# Legs — tightened slightly; knee stays hinge-like.
-	"upleg":    Vector3(80,  60,  45),
-	"leg":      Vector3(5,  148,   5),
-	"foot":     Vector3(52,  32,  22),
+	# Wide X/Z so the spring can track forearm roll / pronation; Y = elbow flex.
+	"forearm":  Vector3(80, 150,  80),
+	"hand":     Vector3(55,  55,  55),
+	# Legs — limit hip flexion so knees don't swing wild; knee stays hinge-like.
+	"upleg":    Vector3(65,  45,  35),
+	"leg":      Vector3(5,  140,   5),
+	"foot":     Vector3(45,  28,  20),
 }
 
 # ---------------------------------------------------------------------------
@@ -217,6 +218,8 @@ func _ready() -> void:
 	_char_body.global_position = _char_pos
 
 	print("[main] Controls: WASD=move  Space=jump  P=limp  O=toggle-meshes  U=next-anim  LClick=shoot  R=reload")
+	# Initialise visibility: vis_mode=0 → visual mesh only, ghost hidden.
+	_update_rig_visibility()
 	# Restart simulation properly (stop→start) so bones go RIGID, then enable springs.
 	# physics_blend stays 0.0 until this completes to avoid a T-pose flash.
 	_go_animated_async()
@@ -435,12 +438,17 @@ func _set_ragdoll_mode(mode: RagdollMode) -> void:
 			# with scattered bones) causes _reload_joint() to create joints from wrong
 			# anchor positions → bones disconnect.  The existing 6DOF joints from
 			# start_simulation() have correct anchors; just let gravity do its work.
-			# We only reduce damping so bones swing freely.
+			# We only adjust damping — higher on torso/spine/hips so the trunk doesn't
+			# fold over, lower on limbs so arms and legs flop naturally.
 			for id: int in _phys_bone_map:
 				var pb: PhysicalBone3D = _phys_bone_map[id]
-				if is_instance_valid(pb):
-					pb.linear_damp  = 0.5    # slight resistance — parts don't slide forever
-					pb.angular_damp = 1.5    # weighted joints — not spinny, still falls naturally
+				if not is_instance_valid(pb):
+					continue
+				var low := pb.name.to_lower()
+				var is_torso := "hip" in low or "spine" in low or "pelvis" in low \
+						or "chest" in low or "neck" in low
+				pb.linear_damp  = 0.8
+				pb.angular_damp = 10.0 if is_torso else 3.0
 			print("[main] Mode: Limp Ragdoll (P to exit)")
 
 

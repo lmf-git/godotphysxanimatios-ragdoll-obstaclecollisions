@@ -14,28 +14,42 @@ extends Node3D
 
 @export_group("Linear Spring")
 @export var linear_stiffness:  float = 600.0
-@export var linear_damping:    float = 40.0
+## Low damping so the spring doesn't immediately fight an external impulse.
+## The physics body's own linear_damp (0.8) handles long-term velocity decay.
+@export var linear_damping:    float = 12.0
 ## Hard cap on the velocity impulse added per physics step (m/s).
-## Keeps spring forces within what the 6DOF constraint solver can absorb.
-@export var max_linear_force:  float = 60.0
+@export var max_linear_force:  float = 30.0
 ## If a body drifts further than this (metres) teleport it instead of springing.
 @export var teleport_threshold: float = 2.0
 
 @export_group("Angular Spring")
 @export var angular_stiffness: float = 800.0
-@export var angular_damping:   float = 80.0
+## Low damping lets the spring oscillate after an impact (bouncy feel) rather
+## than absorbing the impulse in one step.
+@export var angular_damping:   float = 20.0
 ## Hard cap on angular velocity impulse per step (rad/s).
-## 300 lets the spring correct errors up to ~21° in one step uncapped,
-## and converges a 90° error in ~19 frames instead of ~94 at 60.
+## 300 is needed so the spring can track fast animation arm swings (~5 rad/s peak).
+## Per-bone impact response is handled by disable_bone_spring(), not by lowering this.
 @export var max_angular_force: float = 300.0
 
 ## bone_id (int) → RigidBody3D — populated by main.gd before add_child.
 var phys_body_map: Dictionary = {}
 
+## bone_id → seconds remaining for which the spring is disabled on that bone.
+## Set via disable_bone_spring() when an external impulse (ball hit) is applied.
+var bone_spring_override: Dictionary = {}
+
 
 func _ready() -> void:
 	print("[phys_driver] _ready() — target=%s  bodies=%d" % [
 		is_instance_valid(target_skeleton), phys_body_map.size()])
+
+
+## Temporarily suspend the spring on a single bone so an external impulse
+## (ball hit, ragdoll transition) can register without being immediately
+## countered.  After duration seconds the spring re-engages at full strength.
+func disable_bone_spring(bone_id: int, duration: float) -> void:
+	bone_spring_override[bone_id] = duration
 
 
 func _physics_process(_delta: float) -> void:
@@ -47,6 +61,12 @@ func _physics_process(_delta: float) -> void:
 	for bone_id: int in phys_body_map:
 		var rb: PhysicalBone3D = phys_body_map[bone_id]
 		if not is_instance_valid(rb):
+			continue
+		# Per-bone impact override: let the body react freely for the duration.
+		if bone_spring_override.has(bone_id):
+			bone_spring_override[bone_id] -= dt
+			if bone_spring_override[bone_id] <= 0.0:
+				bone_spring_override.erase(bone_id)
 			continue
 		_apply_spring(bone_id, rb, dt)
 

@@ -6,20 +6,27 @@ const ANIM_DIR    := "res://animations/"
 
 const SKIP_BONE_FRAGMENTS: Array[String] = [
 	"ik", "pole", "ctrl", "_end",
+	# Finger and toe phalanges are too small for stable joint simulation.
+	# They detach under impulse loads and add no meaningful ragdoll benefit.
+	# They stay kinematic — the animation drives them directly.
+	"index", "middle", "ring", "pinky", "thumb", "toe",
 ]
 
 const BONE_LIMITS: Dictionary = {
-	"hips":     Vector3(30,  30,  45),
-	"spine":    Vector3(15,  15,  20),
-	"neck":     Vector3(30,  30,  30),
-	"head":     Vector3(40,  40,  30),
-	"shoulder": Vector3(20,  20,  20),
-	"arm":      Vector3(90,  90,  90),
-	"forearm":  Vector3(5,  140,   5),
-	"hand":     Vector3(45,  45,  45),
-	"upleg":    Vector3(80,  80,  45),
-	"leg":      Vector3(5,  145,   5),
-	"foot":     Vector3(50,  30,  20),
+	# Hips / spine — tighter than before so the ragdoll can't fold in on itself.
+	"hips":     Vector3(35,  35,  40),
+	"spine":    Vector3(20,  20,  22),
+	"neck":     Vector3(45,  45,  35),
+	"head":     Vector3(45,  45,  35),
+	# Shoulder / arm — generous ball-socket range for natural animation.
+	"shoulder": Vector3(65,  65,  65),
+	"arm":      Vector3(95,  95,  95),
+	"forearm":  Vector3(5,  150,   5),
+	"hand":     Vector3(50,  50,  50),
+	# Legs — tightened slightly; knee stays hinge-like.
+	"upleg":    Vector3(80,  60,  45),
+	"leg":      Vector3(5,  148,   5),
+	"foot":     Vector3(52,  32,  22),
 }
 
 # ---------------------------------------------------------------------------
@@ -61,7 +68,8 @@ var _anim_idx:  int = 0
 var _anim_idle:     String = ""
 var _anim_walk_fwd: String = ""
 var _anim_walk_bwd: String = ""
-var _loco_state:    String = ""   # "idle" | "walk_fwd" | "walk_bwd"
+var _anim_jump:     String = ""
+var _loco_state:    String = ""   # "idle" | "walk_fwd" | "walk_bwd" | "jump"
 
 # ---------------------------------------------------------------------------
 # Character movement
@@ -73,8 +81,13 @@ var _char_yaw: float   = 0.0   # radians — 0 = faces +Z (Mixamo FBX default in
 var _prev_char_pos: Vector3 = Vector3(0.0, 0.1, 0.0)
 var _prev_char_yaw: float   = 0.0
 
+var _is_grounded:   bool  = true
+var _vert_velocity: float = 0.0
+
 const MOVE_SPEED  := 2.5   # m/s
 const TURN_SPEED  := 2.0   # rad/s
+const JUMP_SPEED  := 5.5   # m/s  upward launch velocity
+const GRAVITY     := 14.0  # m/s² downward acceleration
 
 # ---------------------------------------------------------------------------
 # Camera
@@ -184,9 +197,15 @@ func _ready() -> void:
 
 	_make_ledge()
 
-	# Invisible capsule so the character collides properly with walls/ledge.
+	# Invisible capsule — wall/ledge collision for WASD movement only.
+	# Layer 2 / mask 1: the capsule stops against layer-1 static geometry
+	# (ledges, walls) but is invisible to balls and physics bones which both
+	# sit on layer 1.  This prevents the capsule from intercepting ball shots
+	# before they reach the physics bones and from blocking bone↔ledge contact.
 	_char_body = CharacterBody3D.new()
 	_char_body.name = "CharacterBody"
+	_char_body.collision_layer = 2   # invisible to layer-1 scanners
+	_char_body.collision_mask  = 1   # detects layer-1 static geometry
 	var cap := CapsuleShape3D.new()
 	cap.radius = 0.35
 	cap.height = 1.7
@@ -197,7 +216,7 @@ func _ready() -> void:
 	add_child(_char_body)
 	_char_body.global_position = _char_pos
 
-	print("[main] Controls: WASD=move  P=limp  O=toggle-meshes  U=next-anim  LClick=shoot  R=reload")
+	print("[main] Controls: WASD=move  Space=jump  P=limp  O=toggle-meshes  U=next-anim  LClick=shoot  R=reload")
 	# Restart simulation properly (stop→start) so bones go RIGID, then enable springs.
 	# physics_blend stays 0.0 until this completes to avoid a T-pose flash.
 	_go_animated_async()
@@ -212,6 +231,10 @@ func _process(delta: float) -> void:
 	_update_containers()
 	_update_camera(delta)
 	_update_locomotion_anim()
+
+
+func _physics_process(_delta: float) -> void:
+	_carry_bodies_with_container()
 
 
 func _handle_movement(delta: float) -> void:
@@ -236,7 +259,22 @@ func _handle_movement(delta: float) -> void:
 			_char_pos.z = _char_body.global_position.z
 		else:
 			_char_pos += forward * fwd_input * MOVE_SPEED * delta
-	_char_pos.y = 0.1   # always flat floor
+
+	# Jump — only when grounded and in animated mode (not ragdoll).
+	if Input.is_key_pressed(KEY_SPACE) and _is_grounded and _mode == RagdollMode.ANIMATED:
+		_vert_velocity = JUMP_SPEED
+		_is_grounded   = false
+
+	# Vertical integration — gravity when airborne, snap to floor when landed.
+	if not _is_grounded:
+		_vert_velocity -= GRAVITY * delta
+		_char_pos.y    += _vert_velocity * delta
+		if _char_pos.y <= 0.1:
+			_char_pos.y    = 0.1
+			_vert_velocity = 0.0
+			_is_grounded   = true
+	else:
+		_char_pos.y = 0.1
 
 
 func _update_containers() -> void:
@@ -257,6 +295,52 @@ func _update_camera(delta: float) -> void:
 	var t := minf(CAM_LERP * delta, 1.0)
 	_camera.global_position = _camera.global_position.lerp(cam_target, t)
 	_camera.look_at(_char_pos + Vector3(0.0, 1.0, 0.0), Vector3.UP)
+
+
+func _carry_bodies_with_container() -> void:
+	# Physics bodies live in world space — the physics server has no knowledge of the
+	# Node3D container hierarchy.  When the character moves or turns, the container
+	# transforms update instantly but the rigid bodies remain at their old world
+	# positions.  This causes two visible bugs:
+	#   1. The physical/visual mesh doesn't rotate with the character.
+	#   2. interpolated_animation.gd's (inv_skel * phys_xform) gives wrong local
+	#      positions because inv_skel has rotated but phys_xform hasn't.
+	#
+	# Fix: every physics step compute the container's translation + yaw delta and
+	# directly carry each body to its new world position, then rotate its velocity
+	# into the new frame.  The spring then handles only small pose corrections.
+
+	var yaw_delta := _char_yaw - _prev_char_yaw
+	var pos_delta := _char_pos  - _prev_char_pos
+	var from_pos  := _prev_char_pos   # pivot for the yaw orbit
+
+	# Always keep prev in sync regardless of mode so deltas stay accurate.
+	_prev_char_yaw = _char_yaw
+	_prev_char_pos = _char_pos
+
+	# Only carry bodies in animated mode while the spring is active.
+	# During limp the ragdoll should fall freely; during the async rebuild
+	# (spring_enabled == false) bodies are kinematic and are being reset.
+	if _mode != RagdollMode.ANIMATED or _phys_bone_map.is_empty():
+		return
+	if is_instance_valid(_phys_driver) and not _phys_driver.get("spring_enabled"):
+		return
+
+	if absf(yaw_delta) < 1e-6 and pos_delta.length_squared() < 1e-8:
+		return
+
+	var rot := Basis(Vector3.UP, yaw_delta)
+
+	for id: int in _phys_bone_map:
+		var pb: PhysicalBone3D = _phys_bone_map[id]
+		if not is_instance_valid(pb):
+			continue
+		# Orbit around the OLD character pivot, then shift to new position.
+		pb.global_position  = _char_pos + rot * (pb.global_position - from_pos)
+		# Rotate existing velocity into the new frame so spring corrections
+		# remain valid after the container has turned.
+		pb.linear_velocity  = rot * pb.linear_velocity
+		pb.angular_velocity = rot * pb.angular_velocity
 
 
 # ===========================================================================
@@ -338,6 +422,14 @@ func _set_ragdoll_mode(mode: RagdollMode) -> void:
 			# Pause animation — springs are off so the animated skeleton no longer matters.
 			if is_instance_valid(_anim_player): _anim_player.pause()
 			_loco_state = ""
+			_is_grounded   = true
+			_vert_velocity = 0.0
+			# Kill any active knockback recovery so a stale tween can't corrupt
+			# spring stiffness when returning to animated later.
+			if _recovery_tween:
+				_recovery_tween.kill()
+				_recovery_tween = null
+			_knockback_busy = false
 			# IMPORTANT: we do NOT change joint_type or angular limits here.
 			# Changing joint parameters while simulation is running (or after stop/restart
 			# with scattered bones) causes _reload_joint() to create joints from wrong
@@ -347,8 +439,8 @@ func _set_ragdoll_mode(mode: RagdollMode) -> void:
 			for id: int in _phys_bone_map:
 				var pb: PhysicalBone3D = _phys_bone_map[id]
 				if is_instance_valid(pb):
-					pb.linear_damp  = 0.05
-					pb.angular_damp = 0.05
+					pb.linear_damp  = 0.5    # slight resistance — parts don't slide forever
+					pb.angular_damp = 1.5    # weighted joints — not spinny, still falls naturally
 			print("[main] Mode: Limp Ragdoll (P to exit)")
 
 
@@ -370,15 +462,36 @@ func _go_animated_async() -> void:
 	await get_tree().physics_frame
 	if _mode != RagdollMode.ANIMATED:
 		return
-	# Springs on — bones are now RIGID and driven toward the animation pose.
-	# Restore full stiffness in case a knockback had reduced it.
+
+	# Enable spring at 3× stiffness + high force caps so bodies converge fast
+	# without violating joint constraints (teleporting after joints are anchored
+	# causes constraint violations that fight the spring permanently).
 	if is_instance_valid(_phys_driver):
-		_phys_driver.set("spring_enabled", true)
-		_phys_driver.set("linear_stiffness",  600.0)
-		_phys_driver.set("angular_stiffness", 800.0)
-	# Switch visual to physics-driven now that bones are in the correct pose.
-	if is_instance_valid(_vis_driver): _vis_driver.set("physics_blend", 1.0)
-	print("[main] Animated: joints rebuilt, springs active, physics_blend=1.0")
+		_phys_driver.set("spring_enabled",    true)
+		_phys_driver.set("linear_stiffness",  1800.0)
+		_phys_driver.set("angular_stiffness", 2400.0)
+		_phys_driver.set("max_linear_force",  40.0)   # high cap → fast convergence
+		_phys_driver.set("max_angular_force", 200.0)
+
+	# Blend visual from animation → physics over 0.2 s so residual
+	# convergence is hidden behind the animation pose.
+	if is_instance_valid(_vis_driver):
+		_vis_driver.set("physics_blend", 0.0)
+		var tw := (_vis_driver as Node).create_tween()
+		tw.tween_property(_vis_driver as Node, "physics_blend", 1.0, 0.2)
+
+	# After 0.4 s bodies have converged — ramp stiffness and caps to the
+	# impact-responsive normal values.
+	get_tree().create_timer(0.4).timeout.connect(func():
+		if _mode != RagdollMode.ANIMATED or not is_instance_valid(_phys_driver):
+			return
+		var ramp := create_tween()
+		ramp.tween_property(_phys_driver, "linear_stiffness",  600.0, 0.3).set_ease(Tween.EASE_OUT)
+		ramp.parallel().tween_property(_phys_driver, "angular_stiffness", 800.0, 0.3).set_ease(Tween.EASE_OUT)
+		ramp.tween_property(_phys_driver, "max_linear_force",   30.0, 0.3).set_ease(Tween.EASE_OUT)
+		ramp.parallel().tween_property(_phys_driver, "max_angular_force", 300.0, 0.3).set_ease(Tween.EASE_OUT)
+	)
+	print("[main] Animated: joints rebuilt, high-stiffness burst active")
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +590,11 @@ func _on_ball_hit(body: Node3D, ball: RigidBody3D, counted: Array) -> void:
 	var pb := body as PhysicalBone3D
 	var impulse := ball.linear_velocity * 0.6
 	pb.apply_impulse(impulse, Vector3(0.0, 0.15, 0.0))
+	# Suspend the spring on the hit bone so it can react freely for 0.4 s
+	# before being pulled back.  High-cap spring overwhelms any impulse
+	# instantly; per-bone disable lets the impact register naturally.
+	if is_instance_valid(_phys_driver):
+		_phys_driver.call("disable_bone_spring", pb.get_bone_id(), 0.4)
 	# Only count once per ball — a single shot can graze several bone
 	# capsules in the same physics frame, firing body_entered multiple times.
 	if counted[0]:
@@ -504,15 +622,14 @@ func _trigger_knockback() -> void:
 		_recovery_tween.kill()
 		_recovery_tween = null
 
-	# Reduce (not disable) spring stiffness so bones visibly react to the
-	# impact but the character staggers rather than fully collapsing.
-	# Springs stay enabled so there is always a restoring force pulling the
-	# skeleton back toward the animation pose.
+	# Reduce spring stiffness to ~25 % for a brief stagger — the low damping
+	# and cap values already allow per-limb impact response without needing
+	# a full global collapse.  Spring stays enabled for a restoring force.
 	if is_instance_valid(_phys_driver):
-		_phys_driver.set("linear_stiffness",  60.0)   # 10 % of normal
-		_phys_driver.set("angular_stiffness", 80.0)
+		_phys_driver.set("linear_stiffness",  150.0)   # ~25 % of normal
+		_phys_driver.set("angular_stiffness", 200.0)
 
-	get_tree().create_timer(1.0).timeout.connect(_recover_knockback)
+	get_tree().create_timer(0.5).timeout.connect(_recover_knockback)
 
 
 
@@ -541,9 +658,10 @@ func _update_locomotion_anim() -> void:
 		return
 
 	var new_state: String
-	if Input.is_key_pressed(KEY_W):   new_state = "walk_fwd"
+	if not _is_grounded:              new_state = "jump"
+	elif Input.is_key_pressed(KEY_W): new_state = "walk_fwd"
 	elif Input.is_key_pressed(KEY_S): new_state = "walk_bwd"
-	else:                              new_state = "idle"
+	else:                             new_state = "idle"
 
 	if new_state == _loco_state:
 		return
@@ -551,12 +669,13 @@ func _update_locomotion_anim() -> void:
 
 	var key: String
 	match new_state:
+		"jump":     key = _anim_jump     if not _anim_jump.is_empty()     else _anim_idle
 		"walk_fwd": key = _anim_walk_fwd if not _anim_walk_fwd.is_empty() else _anim_idle
 		"walk_bwd": key = _anim_walk_bwd if not _anim_walk_bwd.is_empty() else _anim_idle
 		_:          key = _anim_idle
 
 	if _anim_player.has_animation(key):
-		_anim_player.play(key, 0.25)
+		_anim_player.play(key, 0.15)
 		print("[main] Loco: %s → %s" % [new_state, key])
 
 
@@ -567,6 +686,7 @@ func _find_locomotion_keys() -> void:
 	var idle_score     := 9999
 	var walk_fwd_score := 9999
 	var walk_bwd_score := 9999
+	var jump_score     := 9999
 
 	for k: String in _anim_keys:
 		var low   := k.to_lower()
@@ -579,7 +699,7 @@ func _find_locomotion_keys() -> void:
 				or "samba"    in low or "villain"  in low or "hostage"  in low \
 				or "crime"    in low or "combat"   in low or "crouch"   in low \
 				or "weapon"   in low or "shoot"    in low or "variation"in low \
-				or "hip"      in low
+				or "zombie"   in low or "hip"      in low
 		if "idle" in low and not idle_neg:
 			var score := words + (1 if "standing" in low else 0)
 			if score < idle_score:
@@ -593,7 +713,8 @@ func _find_locomotion_keys() -> void:
 				or "strafe"   in low or "zombie"   in low or "sneak"   in low \
 				or "run"      in low or "jog"      in low or "crouch"  in low \
 				or " right"   in low or " left"    in low or "injured" in low \
-				or "drunk"    in low or "aim"      in low or "limp"    in low
+				or "drunk"    in low or "aim"      in low or "limp"    in low \
+				or "female"   in low or "feminine" in low
 		if "walk" in low and not wf_neg:
 			if words < walk_fwd_score:
 				walk_fwd_score = words
@@ -602,14 +723,22 @@ func _find_locomotion_keys() -> void:
 		# --- Walk backward ---
 		var wb_neg := "catwalk"  in low or "rifle"   in low or "gun"     in low \
 				or "turn"      in low or "injured" in low or "zombie"  in low \
-				or "limp"      in low
+				or "limp"      in low or "arc"     in low
 		if "walk" in low and ("back" in low or "backward" in low) and not wb_neg:
 			if words < walk_bwd_score:
 				walk_bwd_score = words
 				_anim_walk_bwd = k
 
-	print("[main] Loco keys — idle:'%s'  walk_fwd:'%s'  walk_bwd:'%s'" \
-			% [_anim_idle, _anim_walk_fwd, _anim_walk_bwd])
+		# --- Jump ---
+		var jmp_neg := "flip" in low or "roll" in low or "crawl" in low \
+				or "crouch" in low or "attack" in low
+		if ("jump" in low or "jumping" in low) and not jmp_neg:
+			if words < jump_score:
+				jump_score = words
+				_anim_jump = k
+
+	print("[main] Loco keys — idle:'%s'  walk_fwd:'%s'  walk_bwd:'%s'  jump:'%s'" \
+			% [_anim_idle, _anim_walk_fwd, _anim_walk_bwd, _anim_jump])
 
 
 # ===========================================================================
@@ -766,6 +895,7 @@ func _setup_animation_player(character_root: Node) -> void:
 				if not lib.has_animation(key):
 					var anim_copy: Animation = anim.duplicate(true)
 					anim_copy.loop_mode = Animation.LOOP_LINEAR
+					_strip_root_motion(anim_copy)
 					lib.add_animation(key, anim_copy)
 					loaded += 1
 				if not sample_printed:
@@ -808,6 +938,34 @@ func _find_animation_player(node: Node) -> AnimationPlayer:
 		if result:
 			return result
 	return null
+
+
+func _strip_root_motion(anim: Animation) -> void:
+	# Zero X,Z position on root/hips bone tracks so every animation plays
+	# in-place.  Mixamo FBX exports bake world-space locomotion into the
+	# hips bone; without stripping the track, looping clips snap the
+	# character back to their baked start position on each loop — visible as
+	# "being dragged forward/backward" while walking.
+	# Y is kept so vertical motion (crouch bob, jump arc) still plays.
+	for t in anim.get_track_count():
+		if anim.track_get_type(t) != Animation.TYPE_POSITION_3D:
+			continue
+		var path  := str(anim.track_get_path(t))
+		var colon := path.rfind(":")
+		var bone  := path.substr(colon + 1) if colon >= 0 else ""
+		if bone.is_empty():
+			continue
+		# Strip from any true root bone (skeleton parent == -1) or hips.
+		var should_strip := "hip" in bone.to_lower()
+		if not should_strip and is_instance_valid(_anim_skeleton):
+			var bi := _anim_skeleton.find_bone(bone)
+			if bi >= 0 and _anim_skeleton.get_bone_parent(bi) < 0:
+				should_strip = true
+		if not should_strip:
+			continue
+		for i in anim.track_get_key_count(t):
+			var v: Vector3 = anim.track_get_key_value(t, i)
+			anim.track_set_key_value(t, i, Vector3(0.0, v.y, 0.0))
 
 
 # ===========================================================================
@@ -932,5 +1090,31 @@ func _make_ledge() -> void:
 	ledge.add_child(mi)
 
 	add_child(ledge)
-	# Character faces -Z; ledge is 3 m ahead, centred at half the box height.
+	# 3 m in the backward (-Z) direction — walk into it with S key.
 	ledge.global_position = Vector3(0.0, 0.7, -3.0)
+
+	# Floating ledge — shoulder / head height, opposite side so W and S each
+	# hit a different obstacle.
+	var float_ledge := StaticBody3D.new()
+	float_ledge.name = "FloatingLedge"
+
+	var f_shape := BoxShape3D.new()
+	f_shape.size = Vector3(4.0, 0.35, 0.45)
+	var f_col := CollisionShape3D.new()
+	f_col.shape = f_shape
+	float_ledge.add_child(f_col)
+
+	var f_mesh := BoxMesh.new()
+	f_mesh.size = Vector3(4.0, 0.35, 0.45)
+	var f_mat := StandardMaterial3D.new()
+	f_mat.albedo_color = Color(0.35, 0.55, 0.65)
+	f_mat.roughness    = 0.9
+	f_mesh.surface_set_material(0, f_mat)
+	var f_mi := MeshInstance3D.new()
+	f_mi.mesh = f_mesh
+	float_ledge.add_child(f_mi)
+
+	add_child(float_ledge)
+	# 3 m in the forward (+Z) direction, centre at 1.75 m — hits the character
+	# at head height.  Floats visibly above the ground.
+	float_ledge.global_position = Vector3(0.0, 1.75, 3.0)

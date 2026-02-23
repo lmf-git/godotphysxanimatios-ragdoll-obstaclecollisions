@@ -1,6 +1,6 @@
-[gd_scene load_steps=2 format=3 uid="uid://c7b5fjj2if3my"]
+[gd_scene format=3 uid="uid://c7b5fjj2if3my"]
 
-[ext_resource type="Script" path="res://scripts/main.gd" id="1_maingd"]
+[ext_resource type="Script" uid="uid://ccrgmc73oh744" path="res://scripts/main.gd" id="1_maingd"]
 
 [sub_resource type="Environment" id="Environment_1"]
 background_mode = 1
@@ -19,34 +19,34 @@ size = Vector3(20, 0.2, 20)
 albedo_color = Color(0.3, 0.3, 0.35, 1)
 roughness = 0.9
 
-[node name="Main" type="Node3D"]
+[node name="Main" type="Node3D" unique_id=1939788076]
 script = ExtResource("1_maingd")
 
-[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1618481396]
 environment = SubResource("Environment_1")
 
-[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1691163481]
 transform = Transform3D(0.707107, -0.5, 0.5, 0, 0.707107, 0.707107, -0.707107, -0.5, 0.5, 0, 8, 4)
 light_energy = 1.2
 shadow_enabled = true
 
-[node name="Camera3D" type="Camera3D" parent="."]
+[node name="Camera3D" type="Camera3D" parent="." unique_id=1550428537]
 transform = Transform3D(1, 0, 0, 0, 0.936, -0.352, 0, 0.352, 0.936, 0, 1.5, 4)
 
-[node name="Floor" type="StaticBody3D" parent="."]
+[node name="Floor" type="StaticBody3D" parent="." unique_id=1808801922]
 
-[node name="CollisionShape3D" type="CollisionShape3D" parent="Floor"]
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Floor" unique_id=940859490]
 shape = SubResource("BoxShape3D_1")
 
-[node name="MeshInstance3D" type="MeshInstance3D" parent="Floor"]
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Floor" unique_id=2096239562]
 mesh = SubResource("BoxMesh_1")
 surface_material_override/0 = SubResource("StandardMaterial3D_1")
 
-[node name="AnimatedRig" type="Node3D" parent="."]
+[node name="AnimatedRig" type="Node3D" parent="." unique_id=576468843]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)
 
-[node name="PhysicsRig" type="Node3D" parent="."]
+[node name="PhysicsRig" type="Node3D" parent="." unique_id=1475082295]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)
 
-[node name="VisualRig" type="Node3D" parent="."]
+[node name="VisualRig" type="Node3D" parent="." unique_id=284120854]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)

@@ -5,8 +5,7 @@ const MASTER_PATH := "res://characters/Master.fbx"
 const ANIM_DIR    := "res://animations/"
 
 const SKIP_BONE_FRAGMENTS: Array[String] = [
-	"thumb", "index", "middle", "ring", "pinky",
-	"toe", "ik", "pole", "ctrl", "_end",
+	"ik", "pole", "ctrl", "_end",
 ]
 
 const BONE_LIMITS: Dictionary = {
@@ -44,6 +43,11 @@ var _phys_bone_map: Dictionary = {}
 var _ball_targets: Array[PhysicalBone3D] = []
 var _shot_count: int = 0
 
+## Invisible capsule that gives the character solid collision against walls.
+var _char_body: CharacterBody3D
+## 0=VisualRig only  1=VisualRig+ghost  2=ghost only
+var _vis_mode: int = 0
+
 # ---------------------------------------------------------------------------
 # Animation
 # ---------------------------------------------------------------------------
@@ -62,7 +66,7 @@ var _loco_state:    String = ""   # "idle" | "walk_fwd" | "walk_bwd"
 # ---------------------------------------------------------------------------
 
 var _char_pos: Vector3 = Vector3(0.0, 0.1, 0.0)
-var _char_yaw: float   = 0.0   # radians — 0 = faces -Z (Mixamo default in Godot)
+var _char_yaw: float   = 0.0   # radians — 0 = faces +Z (Mixamo FBX default in Godot)
 
 const MOVE_SPEED  := 2.5   # m/s
 const TURN_SPEED  := 2.0   # rad/s
@@ -84,6 +88,7 @@ const CAM_LERP   := 6.0    # follow smoothness
 enum RagdollMode { ANIMATED, ACTIVE, LIMP }
 var _mode: RagdollMode = RagdollMode.ANIMATED
 var _knockback_busy: bool = false
+var _hit_count: int = 0
 
 
 # ===========================================================================
@@ -114,6 +119,7 @@ func _ready() -> void:
 	# force-RIGID fallback below can use it.
 	_build_phys_bone_map(_phys_skeleton)
 	_build_ball_targets()
+	_disable_bone_self_collision()
 	print("[main] Bone map: %d entries, %d targets." % [_phys_bone_map.size(), _ball_targets.size()])
 
 	# PhysicalBone3D bodies need at least one physics frame to register with the server.
@@ -172,7 +178,24 @@ func _ready() -> void:
 	_update_camera(99.0)   # instant snap on first frame
 
 	_make_ledge()
-	print("[main] Controls: WASD=move  G=active-ragdoll  P=limp  U=next-anim  LClick=shoot  R=reload")
+
+	# Invisible capsule so the character collides properly with walls/ledge.
+	_char_body = CharacterBody3D.new()
+	_char_body.name = "CharacterBody"
+	var cap := CapsuleShape3D.new()
+	cap.radius = 0.35
+	cap.height = 1.7
+	var cap_col := CollisionShape3D.new()
+	cap_col.shape = cap
+	cap_col.position = Vector3(0.0, 0.85, 0.0)
+	_char_body.add_child(cap_col)
+	add_child(_char_body)
+	_char_body.global_position = _char_pos
+
+	print("[main] Controls: WASD=move  P=limp  O=toggle-meshes  U=next-anim  LClick=shoot  R=reload")
+	# Restart simulation properly (stop→start) so bones go RIGID, then enable springs.
+	# physics_blend stays 0.0 until this completes to avoid a T-pose flash.
+	_go_animated_async()
 
 
 # ===========================================================================
@@ -187,23 +210,33 @@ func _process(delta: float) -> void:
 
 
 func _handle_movement(delta: float) -> void:
+	# Character faces +Z: positive yaw = CW from above = turns right.
 	if Input.is_key_pressed(KEY_A):
-		_char_yaw += TURN_SPEED * delta
+		_char_yaw -= TURN_SPEED * delta   # CCW = turn left
 	if Input.is_key_pressed(KEY_D):
-		_char_yaw -= TURN_SPEED * delta
+		_char_yaw += TURN_SPEED * delta   # CW  = turn right
 
 	var fwd_input := 0.0
-	if Input.is_key_pressed(KEY_W): fwd_input += 1.0   # W = move forward
-	if Input.is_key_pressed(KEY_S): fwd_input -= 1.0   # S = move backward
+	if Input.is_key_pressed(KEY_W): fwd_input += 1.0
+	if Input.is_key_pressed(KEY_S): fwd_input -= 1.0
 
 	if fwd_input != 0.0:
-		# Character faces -Z; rotate by yaw to get world forward.
-		var forward := Basis(Vector3.UP, _char_yaw) * Vector3(0.0, 0.0, -1.0)
-		_char_pos += forward * fwd_input * MOVE_SPEED * delta
-		_char_pos.y = 0.1   # stay on floor
+		var forward := Basis(Vector3.UP, _char_yaw) * Vector3(0.0, 0.0, 1.0)
+		if _char_body != null:
+			# Sync capsule to current character position, then slide with collision.
+			_char_body.global_position = _char_pos
+			_char_body.velocity = Vector3(forward.x, 0.0, forward.z) * fwd_input * MOVE_SPEED
+			_char_body.move_and_slide()
+			_char_pos.x = _char_body.global_position.x
+			_char_pos.z = _char_body.global_position.z
+		else:
+			_char_pos += forward * fwd_input * MOVE_SPEED * delta
+	_char_pos.y = 0.1   # always flat floor
 
 
 func _update_containers() -> void:
+	# Character faces +Z in the FBX.  No extra rotation needed — camera and
+	# movement are set up for a +Z-facing character.
 	var t := Transform3D(Basis(Vector3.UP, _char_yaw), _char_pos)
 	if is_instance_valid(_anim_container): _anim_container.transform = t
 	if is_instance_valid(_phys_container): _phys_container.transform = t
@@ -213,8 +246,8 @@ func _update_containers() -> void:
 func _update_camera(delta: float) -> void:
 	if _camera == null:
 		return
-	# Back direction in world space (character faces -Z, so back is +Z).
-	var back := Basis(Vector3.UP, _char_yaw) * Vector3(0.0, 0.0, 1.0)
+	# Character faces +Z, so "behind" is the -Z side.
+	var back := Basis(Vector3.UP, _char_yaw) * Vector3(0.0, 0.0, -1.0)
 	var cam_target := _char_pos + back * CAM_DIST + Vector3(0.0, CAM_HEIGHT, 0.0)
 	var t := minf(CAM_LERP * delta, 1.0)
 	_camera.global_position = _camera.global_position.lerp(cam_target, t)
@@ -238,10 +271,11 @@ func _unhandled_input(event: InputEvent) -> void:
 	if not key.pressed:
 		return
 	match key.keycode:
-		KEY_G:
-			_toggle_mode(RagdollMode.ACTIVE)
 		KEY_P:
 			_toggle_mode(RagdollMode.LIMP)
+		KEY_O:
+			_vis_mode = (_vis_mode + 1) % 3
+			_update_rig_visibility()
 		KEY_U:
 			_next_animation()
 		KEY_R:
@@ -256,12 +290,23 @@ func _toggle_mode(new_mode: RagdollMode) -> void:
 	_set_ragdoll_mode(RagdollMode.ANIMATED if _mode == new_mode else new_mode)
 
 
+func _update_rig_visibility() -> void:
+	# 0 = visual only  |  1 = visual + animated ghost  |  2 = ghost only
+	if is_instance_valid(_vis_container):
+		_vis_container.visible  = (_vis_mode != 2)
+	if is_instance_valid(_anim_container):
+		_anim_container.visible = (_vis_mode != 0)
+	var labels := ["Visual only", "Visual + ghost", "Ghost only"]
+	print("[main] Mesh view: %s" % labels[_vis_mode])
+
+
 func _set_ragdoll_mode(mode: RagdollMode) -> void:
 	_mode = mode
 	match mode:
 		RagdollMode.ANIMATED:
+			_hit_count = 0
 			_set_limp_joints(false)
-			# Visual goes back to animation-driven (no dependency on physics bone state).
+			# Visual temporarily goes animation-driven while simulation restarts.
 			if is_instance_valid(_vis_driver): _vis_driver.set("physics_blend", 0.0)
 			# Resume animation and let locomotion system pick the right clip.
 			_loco_state = ""
@@ -328,8 +373,11 @@ func _go_animated_async() -> void:
 	await get_tree().physics_frame
 	if _mode != RagdollMode.ANIMATED:
 		return
+	# Springs on — bones are now RIGID and driven toward the animation pose.
 	if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", true)
-	print("[main] Animated: joints rebuilt, springs active.")
+	# Switch visual to physics-driven now that bones are in the correct pose.
+	if is_instance_valid(_vis_driver): _vis_driver.set("physics_blend", 1.0)
+	print("[main] Animated: joints rebuilt, springs active, physics_blend=1.0")
 
 
 # ---------------------------------------------------------------------------
@@ -405,31 +453,44 @@ func _shoot_ball() -> void:
 	ball.linear_velocity  = (target_pos - spawn_pos).normalized() * 18.0
 
 	var ball_ref: WeakRef = weakref(ball)
+	# counted[0] is a mutable flag so all contacts from this ball share it.
+	# A single shot can touch several bone capsules in one physics frame;
+	# only the first contact should increment _hit_count.
+	var counted := [false]
 	ball.body_entered.connect(func(body: Node3D):
 		var b := ball_ref.get_ref() as RigidBody3D
-		if b: _on_ball_hit(body, b))
+		if b: _on_ball_hit(body, b, counted))
 
 	get_tree().create_timer(6.0).timeout.connect(func():
 		var b := ball_ref.get_ref() as RigidBody3D
 		if b: b.queue_free())
 
 
-func _on_ball_hit(body: Node3D, ball: RigidBody3D) -> void:
+func _on_ball_hit(body: Node3D, ball: RigidBody3D, counted: Array) -> void:
 	if not (body is PhysicalBone3D):
 		return
 	if not is_instance_valid(ball):
 		return
-	print("[main] Ball hit: %s" % body.name)
 	ball.collision_layer = 0
 	ball.collision_mask  = 0
 	var pb := body as PhysicalBone3D
 	var impulse := ball.linear_velocity * 0.6
-	# apply_impulse at an offset creates both linear and angular response.
-	# The 0.15 m Y offset means the force acts above the bone centre,
-	# producing a natural rotation around the joint even when translation
-	# is constrained by the 6DOF joint.
 	pb.apply_impulse(impulse, Vector3(0.0, 0.15, 0.0))
-	_trigger_knockback()
+	# Only count once per ball — a single shot can graze several bone
+	# capsules in the same physics frame, firing body_entered multiple times.
+	if counted[0]:
+		return
+	counted[0] = true
+	print("[main] Ball hit: %s" % body.name)
+	if _mode == RagdollMode.LIMP:
+		return   # already limp — impulse applied, nothing else needed
+	_hit_count += 1
+	print("[main] Hit count: %d/3" % _hit_count)
+	if _hit_count >= 3:
+		_hit_count = 0
+		_set_ragdoll_mode(RagdollMode.LIMP)
+	else:
+		_trigger_knockback()
 
 
 func _trigger_knockback() -> void:
@@ -451,10 +512,12 @@ func _kick_limp_bones() -> void:
 	for id: int in _phys_bone_map:
 		var pb: PhysicalBone3D = _phys_bone_map[id]
 		if is_instance_valid(pb) and pb.get_rid().is_valid():
+			# Minimal X/Z variation — keeps bones from scattering sideways.
+			# Gravity handles the downward fall; this just breaks the static pose.
 			var impulse := Vector3(
-					randf_range(-1.5, 1.5),
-					randf_range(-8.0, -5.0),   # strong downward kick
-					randf_range(-1.5, 1.5))
+					randf_range(-0.08, 0.08),
+					randf_range(-1.0, -0.3),
+					randf_range(-0.08, 0.08))
 			PhysicsServer3D.body_apply_central_impulse(pb.get_rid(), impulse)
 
 
@@ -477,12 +540,21 @@ func _set_limp_joints(limp: bool) -> void:
 		if not is_instance_valid(pb):
 			continue
 		if limp:
-			# Remove ALL joint constraints so every bone falls freely under gravity.
-			# (The physics server only applies these changes after stop/start — see
-			# _go_limp_async which restarts the simulation immediately after.)
-			pb.joint_type   = PhysicalBone3D.JOINT_TYPE_NONE
-			pb.linear_damp  = 0.05
-			pb.angular_damp = 0.05
+			# Keep JOINT_TYPE_6DOF so bones stay connected at pivot points.
+			# Open the angular limits to ±170° so every joint rotates freely —
+			# the skeleton flops under gravity without the body splitting apart.
+			pb.joint_type   = PhysicalBone3D.JOINT_TYPE_6DOF
+			pb.linear_damp  = 0.1
+			pb.angular_damp = 0.2
+			pb.set("joint/angular_limit_x/enabled",      true)
+			pb.set("joint/angular_limit_x/lower_angle",  -deg_to_rad(170.0))
+			pb.set("joint/angular_limit_x/upper_angle",   deg_to_rad(170.0))
+			pb.set("joint/angular_limit_y/enabled",      true)
+			pb.set("joint/angular_limit_y/lower_angle",  -deg_to_rad(170.0))
+			pb.set("joint/angular_limit_y/upper_angle",   deg_to_rad(170.0))
+			pb.set("joint/angular_limit_z/enabled",      true)
+			pb.set("joint/angular_limit_z/lower_angle",  -deg_to_rad(170.0))
+			pb.set("joint/angular_limit_z/upper_angle",   deg_to_rad(170.0))
 		else:
 			# Restore constrained 6DOF joint for spring-driven animation.
 			pb.joint_type   = PhysicalBone3D.JOINT_TYPE_6DOF
@@ -579,6 +651,20 @@ func _build_ball_targets() -> void:
 		var pb: PhysicalBone3D = _phys_bone_map[id]
 		if not _ball_targets.has(pb):
 			_ball_targets.append(pb)
+
+
+func _disable_bone_self_collision() -> void:
+	# Prevent physical bones from colliding with each other.
+	# Without this, capsule-capsule contacts between adjacent bones produce
+	# large impulses that overwhelm the joint solver and fling limbs apart.
+	var bones := _phys_bone_map.values()
+	for i in bones.size():
+		for j in range(i + 1, bones.size()):
+			var a := bones[i] as PhysicalBone3D
+			var b := bones[j] as PhysicalBone3D
+			if is_instance_valid(a) and is_instance_valid(b):
+				a.add_collision_exception_with(b)
+	print("[main] Self-collision disabled for %d bones." % bones.size())
 
 
 func _build_phys_bone_map(node: Node) -> void:
@@ -740,8 +826,8 @@ func _create_physical_bones(skeleton: Skeleton3D) -> void:
 			continue
 
 		var length := _estimate_bone_length(skeleton, i)
-		length = clampf(length, 0.05, 0.5)
-		var radius := clampf(length * 0.18, 0.03, 0.12)
+		length = clampf(length, 0.02, 0.8)   # 0.02 covers tiny finger phalanges
+		var radius := clampf(length * 0.2, 0.008, 0.14)
 
 		var shape := CapsuleShape3D.new()
 		shape.radius = radius
@@ -750,6 +836,9 @@ func _create_physical_bones(skeleton: Skeleton3D) -> void:
 		var col := CollisionShape3D.new()
 		col.name = "CollisionShape3D"
 		col.shape = shape
+		# Centre the capsule at the joint origin.  Offsetting along +Y assumes
+		# every bone extends along its local Y, which isn't guaranteed for all
+		# Mixamo bones; centering is stable and orientation-independent.
 
 		var pb := PhysicalBone3D.new()
 		pb.name = "Physical_" + bone_name.replace(":", "_").replace(" ", "_")
@@ -778,13 +867,21 @@ func _skip_bone(bone_name: String) -> bool:
 
 
 func _estimate_bone_length(skeleton: Skeleton3D, bone_idx: int) -> float:
-	var my_rest := skeleton.get_bone_rest(bone_idx)
+	# For bones with multiple children (e.g. Hips → Spine + LeftUpLeg + RightUpLeg)
+	# using the first child in index order gives the wrong length.  Take the LONGEST
+	# child distance so branching bones get a capsule that covers their widest extent.
+	var my_global := skeleton.get_bone_global_rest(bone_idx)
+	var best := 0.0
 	for j in skeleton.get_bone_count():
 		if skeleton.get_bone_parent(j) == bone_idx:
-			return my_rest.origin.distance_to(skeleton.get_bone_rest(j).origin)
+			var d := my_global.origin.distance_to(skeleton.get_bone_global_rest(j).origin)
+			if d > best:
+				best = d
+	if best > 0.0:
+		return best
 	var parent := skeleton.get_bone_parent(bone_idx)
 	if parent >= 0:
-		return my_rest.origin.distance_to(skeleton.get_bone_rest(parent).origin) * 0.5
+		return my_global.origin.distance_to(skeleton.get_bone_global_rest(parent).origin) * 0.5
 	return 0.15
 
 

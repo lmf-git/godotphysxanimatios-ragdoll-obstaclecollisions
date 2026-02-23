@@ -50,16 +50,15 @@ func _process(_delta: float) -> void:
 		else:
 			var phys_xform: Transform3D
 			if phys_bone_map.has(i):
-				# Read directly from the RigidBody-like physics object — always current.
 				var pb: PhysicalBone3D = phys_bone_map[i]
 				if is_instance_valid(pb):
+					# Read directly from the physics body — always the current
+					# physics-server state with no per-frame modifier lag.
 					phys_xform = pb.global_transform
 				else:
 					phys_xform = anim_xform
 			else:
-				# Fallback for skipped bones (fingers, toes, etc.) — use the
-				# animated pose so they follow the animation rather than the
-				# undriven physics skeleton (which is always in T-pose).
+				# Non-physics bones (fingers, toes) follow the animation.
 				phys_xform = anim_xform
 			blended_local = inv_skel * anim_xform.interpolate_with(phys_xform, physics_blend)
 

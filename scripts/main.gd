@@ -47,6 +47,8 @@ var _shot_count: int = 0
 var _char_body: CharacterBody3D
 ## 0=VisualRig only  1=VisualRig+ghost  2=ghost only
 var _vis_mode: int = 0
+## Active tween restoring spring stiffness after knockback.
+var _recovery_tween: Tween
 
 # ---------------------------------------------------------------------------
 # Animation
@@ -67,6 +69,9 @@ var _loco_state:    String = ""   # "idle" | "walk_fwd" | "walk_bwd"
 
 var _char_pos: Vector3 = Vector3(0.0, 0.1, 0.0)
 var _char_yaw: float   = 0.0   # radians — 0 = faces +Z (Mixamo FBX default in Godot)
+## Previous-frame values used to compute the per-physics-step container delta.
+var _prev_char_pos: Vector3 = Vector3(0.0, 0.1, 0.0)
+var _prev_char_yaw: float   = 0.0
 
 const MOVE_SPEED  := 2.5   # m/s
 const TURN_SPEED  := 2.0   # rad/s
@@ -79,7 +84,7 @@ var _camera: Camera3D
 
 const CAM_DIST   := 4.0    # metres behind character
 const CAM_HEIGHT := 1.6    # metres above character root
-const CAM_LERP   := 6.0    # follow smoothness
+const CAM_LERP   := 14.0   # follow smoothness — higher keeps camera tighter behind character
 
 # ---------------------------------------------------------------------------
 # Ragdoll state machine
@@ -305,7 +310,12 @@ func _set_ragdoll_mode(mode: RagdollMode) -> void:
 	match mode:
 		RagdollMode.ANIMATED:
 			_hit_count = 0
-			_set_limp_joints(false)
+			# Restore body damping that was reduced during limp.
+			for id: int in _phys_bone_map:
+				var pb: PhysicalBone3D = _phys_bone_map[id]
+				if is_instance_valid(pb):
+					pb.linear_damp  = 0.8
+					pb.angular_damp = 0.8
 			# Visual temporarily goes animation-driven while simulation restarts.
 			if is_instance_valid(_vis_driver): _vis_driver.set("physics_blend", 0.0)
 			# Resume animation and let locomotion system pick the right clip.
@@ -315,56 +325,43 @@ func _set_ragdoll_mode(mode: RagdollMode) -> void:
 						else (_anim_keys[0] if not _anim_keys.is_empty() else "")
 				if not key.is_empty():
 					_anim_player.play(key)
-			# Restart simulation so 6DOF joints rebuild, then re-enable springs.
+			# Restart simulation so joints rebuild at animation pose, then re-enable springs.
 			_go_animated_async()
 			print("[main] Mode: Animated")
 		RagdollMode.ACTIVE:
-			_set_limp_joints(false)
 			if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", true)
 			if is_instance_valid(_vis_driver):  _vis_driver.set("physics_blend", 1.0)
-			print("[main] Mode: Active Ragdoll (G to exit)")
+			print("[main] Mode: Active Ragdoll")
 		RagdollMode.LIMP:
 			if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", false)
 			if is_instance_valid(_vis_driver):  _vis_driver.set("physics_blend", 1.0)
-			# Stop animation — springs are off so animated skeleton no longer matters,
-			# but halting it avoids any stray modifier influence.
+			# Pause animation — springs are off so the animated skeleton no longer matters.
 			if is_instance_valid(_anim_player): _anim_player.pause()
 			_loco_state = ""
-			_set_limp_joints(true)
-			# Restart simulation asynchronously so JOINT_TYPE_NONE is registered
-			# in the physics server, then force RIGID and kick all bones downward.
-			_go_limp_async()
+			# IMPORTANT: we do NOT change joint_type or angular limits here.
+			# Changing joint parameters while simulation is running (or after stop/restart
+			# with scattered bones) causes _reload_joint() to create joints from wrong
+			# anchor positions → bones disconnect.  The existing 6DOF joints from
+			# start_simulation() have correct anchors; just let gravity do its work.
+			# We only reduce damping so bones swing freely.
+			for id: int in _phys_bone_map:
+				var pb: PhysicalBone3D = _phys_bone_map[id]
+				if is_instance_valid(pb):
+					pb.linear_damp  = 0.05
+					pb.angular_damp = 0.05
 			print("[main] Mode: Limp Ragdoll (P to exit)")
 
-
-func _go_limp_async() -> void:
-	# Joint-type property changes are only applied to the physics server when
-	# the simulation is stopped and restarted — do that on the simulator directly.
-	_simulator.physical_bones_stop_simulation()
-	await get_tree().physics_frame
-	if _mode != RagdollMode.LIMP:
-		return
-	_simulator.physical_bones_start_simulation()
-	await get_tree().physics_frame
-	await get_tree().physics_frame
-	if _mode != RagdollMode.LIMP:
-		return
-	# Verify and report body modes so we can tell if simulation actually started.
-	var rigid_count := 0
-	for id: int in _phys_bone_map:
-		var pb: PhysicalBone3D = _phys_bone_map[id]
-		if is_instance_valid(pb) and pb.get_rid().is_valid():
-			var m := PhysicsServer3D.body_get_mode(pb.get_rid())
-			if m == PhysicsServer3D.BODY_MODE_RIGID:
-				rigid_count += 1
-	print("[main] Limp: %d/%d bones in RIGID mode — kicking." % [rigid_count, _phys_bone_map.size()])
-	_kick_limp_bones()
 
 
 func _go_animated_async() -> void:
 	# Keep springs off until joints have been rebuilt.
 	if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", false)
 	_simulator.physical_bones_stop_simulation()
+	# PhysicalBoneSimulator3D writes the animation pose back to physics bodies
+	# in _process_modification(), which runs during the PROCESS frame — not the
+	# physics frame.  We must wait for it before restarting, otherwise bones
+	# start simulation from their old ragdoll positions and detach visually.
+	await get_tree().process_frame
 	await get_tree().physics_frame
 	if _mode != RagdollMode.ANIMATED:
 		return
@@ -374,7 +371,11 @@ func _go_animated_async() -> void:
 	if _mode != RagdollMode.ANIMATED:
 		return
 	# Springs on — bones are now RIGID and driven toward the animation pose.
-	if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", true)
+	# Restore full stiffness in case a knockback had reduced it.
+	if is_instance_valid(_phys_driver):
+		_phys_driver.set("spring_enabled", true)
+		_phys_driver.set("linear_stiffness",  600.0)
+		_phys_driver.set("angular_stiffness", 800.0)
 	# Switch visual to physics-driven now that bones are in the correct pose.
 	if is_instance_valid(_vis_driver): _vis_driver.set("physics_blend", 1.0)
 	print("[main] Animated: joints rebuilt, springs active, physics_blend=1.0")
@@ -498,69 +499,34 @@ func _trigger_knockback() -> void:
 		return
 	_knockback_busy = true
 
-	# Disable springs so the physics bones react to the impact instead of
-	# being immediately snapped back by the spring forces.
-	# physics_blend is always 1.0 so the visual responds immediately.
-	if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", false)
+	# Kill any in-progress recovery tween so a new hit always wins.
+	if _recovery_tween:
+		_recovery_tween.kill()
+		_recovery_tween = null
 
-	get_tree().create_timer(1.8).timeout.connect(_recover_knockback)
+	# Reduce (not disable) spring stiffness so bones visibly react to the
+	# impact but the character staggers rather than fully collapsing.
+	# Springs stay enabled so there is always a restoring force pulling the
+	# skeleton back toward the animation pose.
+	if is_instance_valid(_phys_driver):
+		_phys_driver.set("linear_stiffness",  60.0)   # 10 % of normal
+		_phys_driver.set("angular_stiffness", 80.0)
 
+	get_tree().create_timer(1.0).timeout.connect(_recover_knockback)
 
-func _kick_limp_bones() -> void:
-	# Apply a downward impulse via PhysicsServer3D directly — this is guaranteed
-	# to work on any RIGID body regardless of property-setter caching.
-	for id: int in _phys_bone_map:
-		var pb: PhysicalBone3D = _phys_bone_map[id]
-		if is_instance_valid(pb) and pb.get_rid().is_valid():
-			# Minimal X/Z variation — keeps bones from scattering sideways.
-			# Gravity handles the downward fall; this just breaks the static pose.
-			var impulse := Vector3(
-					randf_range(-0.08, 0.08),
-					randf_range(-1.0, -0.3),
-					randf_range(-0.08, 0.08))
-			PhysicsServer3D.body_apply_central_impulse(pb.get_rid(), impulse)
 
 
 func _recover_knockback() -> void:
 	_knockback_busy = false
 	if _mode != RagdollMode.ANIMATED:
 		return   # user switched to a manual ragdoll mode — don't auto-recover
-	if is_instance_valid(_phys_driver): _phys_driver.set("spring_enabled", true)
-
-
-# ---------------------------------------------------------------------------
-# Joint limit helpers — unlock for limp collapse, restore for active/animated
-# ---------------------------------------------------------------------------
-
-func _set_limp_joints(limp: bool) -> void:
-	if not is_instance_valid(_phys_skeleton):
+	if not is_instance_valid(_phys_driver):
 		return
-	for id: int in _phys_bone_map:
-		var pb: PhysicalBone3D = _phys_bone_map[id]
-		if not is_instance_valid(pb):
-			continue
-		if limp:
-			# Keep JOINT_TYPE_6DOF so bones stay connected at pivot points.
-			# Open the angular limits to ±170° so every joint rotates freely —
-			# the skeleton flops under gravity without the body splitting apart.
-			pb.joint_type   = PhysicalBone3D.JOINT_TYPE_6DOF
-			pb.linear_damp  = 0.1
-			pb.angular_damp = 0.2
-			pb.set("joint/angular_limit_x/enabled",      true)
-			pb.set("joint/angular_limit_x/lower_angle",  -deg_to_rad(170.0))
-			pb.set("joint/angular_limit_x/upper_angle",   deg_to_rad(170.0))
-			pb.set("joint/angular_limit_y/enabled",      true)
-			pb.set("joint/angular_limit_y/lower_angle",  -deg_to_rad(170.0))
-			pb.set("joint/angular_limit_y/upper_angle",   deg_to_rad(170.0))
-			pb.set("joint/angular_limit_z/enabled",      true)
-			pb.set("joint/angular_limit_z/lower_angle",  -deg_to_rad(170.0))
-			pb.set("joint/angular_limit_z/upper_angle",   deg_to_rad(170.0))
-		else:
-			# Restore constrained 6DOF joint for spring-driven animation.
-			pb.joint_type   = PhysicalBone3D.JOINT_TYPE_6DOF
-			pb.linear_damp  = 0.8
-			pb.angular_damp = 0.8
-			_apply_joint_limits(pb, _phys_skeleton.get_bone_name(id))
+	# Tween stiffness back to normal over 0.5 s so the recovery feels gradual.
+	_recovery_tween = create_tween()
+	_recovery_tween.tween_property(_phys_driver, "linear_stiffness",  600.0, 0.5).set_ease(Tween.EASE_OUT)
+	_recovery_tween.parallel().tween_property(_phys_driver, "angular_stiffness", 800.0, 0.5).set_ease(Tween.EASE_OUT)
+
 
 
 # ---------------------------------------------------------------------------
@@ -595,18 +561,53 @@ func _update_locomotion_anim() -> void:
 
 
 func _find_locomotion_keys() -> void:
+	# Score-based selection: fewest words wins — simpler name = more likely a basic clip.
+	# Extra penalty if the name includes "standing" (Mixamo's "Standing Idle" is often
+	# a stylised/feminine pose; "Idle" or "Breathing Idle" is preferable).
+	var idle_score     := 9999
+	var walk_fwd_score := 9999
+	var walk_bwd_score := 9999
+
 	for k: String in _anim_keys:
-		var low := k.to_lower()
-		if _anim_idle.is_empty() and ("idle" in low or "standing" in low) \
-				and "fight" not in low and "aim" not in low:
-			_anim_idle = k
-		if _anim_walk_fwd.is_empty() and "walk" in low \
-				and "back" not in low and "rifle" not in low \
-				and "arc" not in low and "turn" not in low and "stop" not in low:
-			_anim_walk_fwd = k
-		if _anim_walk_bwd.is_empty() and "walk" in low \
-				and ("back" in low or "backward" in low):
-			_anim_walk_bwd = k
+		var low   := k.to_lower()
+		var words := k.split(" ").size()
+
+		# --- Idle ---
+		var idle_neg := "fight" in low or "aim"       in low or "drunk"    in low \
+				or "gun"      in low or "rifle"    in low or "dance"    in low \
+				or "catwalk"  in low or "female"   in low or "feminine" in low \
+				or "samba"    in low or "villain"  in low or "hostage"  in low \
+				or "crime"    in low or "combat"   in low or "crouch"   in low \
+				or "weapon"   in low or "shoot"    in low or "variation"in low \
+				or "hip"      in low
+		if "idle" in low and not idle_neg:
+			var score := words + (1 if "standing" in low else 0)
+			if score < idle_score:
+				idle_score = score
+				_anim_idle = k
+
+		# --- Walk forward ---
+		var wf_neg := "back"    in low or "backward" in low or "catwalk" in low \
+				or "rifle"    in low or "gun"      in low or "arc"     in low \
+				or "turn"     in low or "stop"     in low or "twist"   in low \
+				or "strafe"   in low or "zombie"   in low or "sneak"   in low \
+				or "run"      in low or "jog"      in low or "crouch"  in low \
+				or " right"   in low or " left"    in low or "injured" in low \
+				or "drunk"    in low or "aim"      in low or "limp"    in low
+		if "walk" in low and not wf_neg:
+			if words < walk_fwd_score:
+				walk_fwd_score = words
+				_anim_walk_fwd = k
+
+		# --- Walk backward ---
+		var wb_neg := "catwalk"  in low or "rifle"   in low or "gun"     in low \
+				or "turn"      in low or "injured" in low or "zombie"  in low \
+				or "limp"      in low
+		if "walk" in low and ("back" in low or "backward" in low) and not wb_neg:
+			if words < walk_bwd_score:
+				walk_bwd_score = words
+				_anim_walk_bwd = k
+
 	print("[main] Loco keys — idle:'%s'  walk_fwd:'%s'  walk_bwd:'%s'" \
 			% [_anim_idle, _anim_walk_fwd, _anim_walk_bwd])
 

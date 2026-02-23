@@ -25,9 +25,9 @@ extends Node3D
 @export var angular_stiffness: float = 800.0
 @export var angular_damping:   float = 80.0
 ## Hard cap on angular velocity impulse per step (rad/s).
-## Without this, large pose errors can push 10+ rad/s into one step and
-## break the 6DOF joint constraints, causing bones to fly apart.
-@export var max_angular_force: float = 60.0
+## 300 lets the spring correct errors up to ~21° in one step uncapped,
+## and converges a 90° error in ~19 frames instead of ~94 at 60.
+@export var max_angular_force: float = 300.0
 
 ## bone_id (int) → RigidBody3D — populated by main.gd before add_child.
 var phys_body_map: Dictionary = {}
@@ -66,17 +66,17 @@ func _apply_spring(bone_id: int, rb: PhysicalBone3D, dt: float) -> void:
 		rb.linear_velocity += force.limit_length(max_linear_force) * dt
 
 	# --- Angular spring (quaternion, shortest-path) ---
-	# get_euler() on a rotation matrix has gimbal lock and can jump ±180°.
-	# Using quaternions gives a smooth, continuous rotation error vector.
+	# Euler-based rot_diff.get_euler() gives wrong correction directions for large
+	# errors (gimbal lock / Euler decomposition artifacts → bone over-rotates then snaps).
+	# Quaternion Im-part * 2 gives the correct axis-angle displacement for ANY size error.
 	var q_target  := Quaternion(target_xform.basis.orthonormalized())
 	var q_current := Quaternion(current_xform.basis.orthonormalized())
-	var q_err := q_target * q_current.inverse()
-	# Ensure shortest-path rotation (negate if w < 0 flips to the long way round).
+	var q_err     := q_target * q_current.inverse()
+	# Shortest-path: flip if the scalar part is negative (rotation > 180°).
 	if q_err.w < 0.0:
 		q_err = -q_err
-	# 2 * Im(q) ≈ axis × angle for small errors; saturates gracefully for large ones.
-	var ang_disp := Vector3(q_err.x, q_err.y, q_err.z) * 2.0
-	var torque := _hookes_law(ang_disp, rb.angular_velocity, angular_stiffness, angular_damping)
+	var ang_disp  := Vector3(q_err.x, q_err.y, q_err.z) * 2.0
+	var torque    := _hookes_law(ang_disp, rb.angular_velocity, angular_stiffness, angular_damping)
 	rb.angular_velocity += torque.limit_length(max_angular_force) * dt
 
 

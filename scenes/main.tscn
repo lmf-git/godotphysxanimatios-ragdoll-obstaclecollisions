@@ -2,6 +2,7 @@
 
 [ext_resource type="Script" uid="uid://ccrgmc73oh744" path="res://scripts/main.gd" id="1_maingd"]
 [ext_resource type="PackedScene" uid="uid://bkconj402oeqs" path="res://characters/Master.fbx" id="2_master"]
+[ext_resource type="PackedScene" path="res://characters/PhysicsCharacter.tscn" id="3_physchar"]
 
 [sub_resource type="Environment" id="Environment_1"]
 background_mode = 1
@@ -51,7 +52,7 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)
 [node name="PhysicsRig" type="Node3D" parent="." unique_id=1475082295]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)
 
-[node name="Character" parent="PhysicsRig" unique_id=982347651 instance=ExtResource("2_master")]
+[node name="Character" parent="PhysicsRig" unique_id=982347651 instance=ExtResource("3_physchar")]
 
 [node name="VisualRig" type="Node3D" parent="." unique_id=284120854]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)

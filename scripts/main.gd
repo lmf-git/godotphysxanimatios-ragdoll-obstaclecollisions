@@ -3,19 +3,6 @@ extends Node3D
 
 const ANIM_DIR := "res://animations/"
 
-const SKIP_BONE_FRAGMENTS: Array[String] = [
-	"ik", "pole", "ctrl", "_end",
-	# Finger and toe phalanges are too small for stable joint simulation.
-	"index", "middle", "ring", "pinky", "thumb", "toe",
-	# Hands and feet skipped — small, distal, little ragdoll benefit.
-	"hand", "foot",
-	# Neck is too small; creates a degenerate joint between Spine2 and Head.
-	"neck",
-	# Clavicles (LeftShoulder/RightShoulder) are irregular geometry with badly
-	# aligned CONE axes that fight arm animations and collide with each other.
-	"shoulder",
-]
-
 
 # ---------------------------------------------------------------------------
 # Rig references
@@ -113,26 +100,31 @@ func _ready() -> void:
 	var phys_root := get_node("PhysicsRig/Character")
 	_phys_skeleton = _find_skeleton(phys_root)
 	_hide_meshes(phys_root)
-	_create_physical_bones(_phys_skeleton)
+	_simulator = _phys_skeleton.find_child("PhysicalBoneSimulator3D") as PhysicalBoneSimulator3D
+
+	if _simulator == null:
+		push_error("[main] PhysicalBoneSimulator3D not found in PhysicsCharacter.tscn — " \
+				+ "run scripts/build_physics_skeleton.gd via Tools → Execute Script first.")
+		return
 
 	# Build bone_id → PhysicalBone3D map FIRST so the simulation check and
 	# force-RIGID fallback below can use it.
 	_build_phys_bone_map(_phys_skeleton)
 	_build_ball_targets()
-	_resize_collision_shapes()
-	_apply_collision_exceptions()
 	print("[main] Bone map: %d entries, %d targets." % [_phys_bone_map.size(), _ball_targets.size()])
 
-	# PhysicalBone3D bodies need at least one physics frame to register with the server.
+	# Wait one physics frame so the PhysicsServer has registered all loaded bodies,
+	# then activate the simulator and fix joint frames before starting simulation.
 	await get_tree().physics_frame
 	_simulator.active = true
-	# Fix CONE joint axes BEFORE starting simulation. Godot's dynamic PhysicalBone3D
-	# creation leaves joint_offset with identity basis, so the cone axis points along
-	# world +X instead of along the bone — this causes explosive constraint violations
-	# on the first physics step.  We recompute the offset from the rest-pose transforms.
+	# Fix CONE joint frames: recompute joint_offset from current rest-pose transforms
+	# so the cone Z axis points along each bone's extension direction.
 	_fix_joint_frames_from_bind_pose()
-	# Call start_simulation on the simulator directly — more reliable than going via Skeleton3D.
+	# Start simulation, then immediately re-apply collision exceptions.
+	# Exceptions must come AFTER start_simulation — starting simulation reassigns
+	# physics body RIDs, so any exceptions registered before are stale.
 	_simulator.physical_bones_start_simulation()
+	_apply_collision_exceptions()
 	# PhysicalBoneSimulator3D is a SkeletonModifier3D — it runs _process_modification()
 	# during the skeleton's process step, NOT the physics step.  Wait one process frame
 	# so the modifier fires and actually flips the bones to dynamic mode, then a physics
@@ -850,41 +842,6 @@ func _fix_joint_frames_from_bind_pose() -> void:
 		b.joint_offset = Transform3D(Basis(cone_x, cone_y, cone_z), new_origin)
 
 
-func _resize_collision_shapes() -> void:
-	# Replace auto-generated shapes (proportional to bone length — often too small)
-	# with anatomically scaled capsules for a ~1.7 m character. Undersized shapes
-	# create enormous penetration-correction forces that blow joints apart.
-	for bone_id: int in _phys_bone_map:
-		var bone: PhysicalBone3D = _phys_bone_map[bone_id]
-		var col := bone.get_node_or_null(^"CollisionShape3D") as CollisionShape3D
-		if col == null:
-			continue
-		var cap := CapsuleShape3D.new()
-		var bname: String = bone.bone_name
-		if   bname.ends_with("Hips"):
-			cap.radius = 0.12;  cap.height = 0.25
-		elif bname.ends_with("Spine2"):
-			cap.radius = 0.10;  cap.height = 0.22
-		elif bname.ends_with("Head"):
-			cap.radius = 0.09;  cap.height = 0.16
-		elif bname.ends_with("LeftArm") or bname.ends_with("RightArm"):
-			cap.radius = 0.045; cap.height = 0.26
-		elif bname.ends_with("LeftForeArm") or bname.ends_with("RightForeArm"):
-			cap.radius = 0.035; cap.height = 0.24
-		elif bname.ends_with("LeftHand") or bname.ends_with("RightHand"):
-			cap.radius = 0.04;  cap.height = 0.08
-		elif bname.ends_with("LeftUpLeg") or bname.ends_with("RightUpLeg"):
-			cap.radius = 0.07;  cap.height = 0.40
-		elif bname.ends_with("LeftLeg") or bname.ends_with("RightLeg"):
-			cap.radius = 0.055; cap.height = 0.38
-		elif bname.ends_with("LeftFoot") or bname.ends_with("RightFoot"):
-			cap.radius = 0.05;  cap.height = 0.14
-		else:
-			cap.radius = 0.04;  cap.height = 0.10
-		# Keep the existing local transform — it orients the capsule axis correctly.
-		col.shape = cap
-	print("[main] Collision shapes resized for %d bones." % _phys_bone_map.size())
-
 
 func _build_phys_bone_map(node: Node) -> void:
 	if node is PhysicalBone3D:
@@ -1058,147 +1015,36 @@ func _strip_root_motion(anim: Animation) -> void:
 
 
 # ===========================================================================
-# Physical bone creation
+# Physics helpers
 # ===========================================================================
 
-func _create_physical_bones(skeleton: Skeleton3D) -> void:
-	var simulator := PhysicalBoneSimulator3D.new()
-	simulator.name = "PhysicalBoneSimulator3D"
-	skeleton.add_child(simulator)
-	_simulator = simulator   # keep for joint access in limp mode
-
-	var created := 0
-	for i in skeleton.get_bone_count():
-		var bone_name := skeleton.get_bone_name(i)
-		if _skip_bone(bone_name):
-			continue
-
-		var length := _estimate_bone_length(skeleton, i)
-		length = clampf(length, 0.02, 0.8)   # 0.02 covers tiny finger phalanges
-		var radius := clampf(length * 0.2, 0.008, 0.14)
-
-		var shape := CapsuleShape3D.new()
-		shape.radius = radius
-		shape.height = maxf(length, radius * 2.2)
-
-		var col := CollisionShape3D.new()
-		col.name = "CollisionShape3D"
-		col.shape = shape
-		# Centre the capsule at the joint origin.  Offsetting along +Y assumes
-		# every bone extends along its local Y, which isn't guaranteed for all
-		# Mixamo bones; centering is stable and orientation-independent.
-
-		var pb := PhysicalBone3D.new()
-		pb.name = "Physical_" + bone_name.replace(":", "_").replace(" ", "_")
-		pb.joint_type = PhysicalBone3D.JOINT_TYPE_CONE
-		pb.bone_name = bone_name   # MUST be set before add_child
-		_apply_bone_profile(pb, bone_name)
-		# Layer 4 — separate from static geometry (layer 1) so the CharacterBody3D
-		# capsule (mask 1) never collides with physics bones via move_and_slide.
-		# Mask 5 = layer 1 (ledge/walls) + layer 4 (other bones, balls).
-		pb.collision_layer = 4
-		pb.collision_mask  = 5
-
-		pb.add_child(col)
-		simulator.add_child(pb)
-		_apply_joint_limits(pb, bone_name)
-		created += 1
-
-	print("[main] Created %d physical bones." % created)
-	# Do NOT start simulation here — the physics engine hasn't processed these
-	# bodies yet.  Activation is deferred to _ready() after a physics frame.
-
-
-func _skip_bone(bone_name: String) -> bool:
-	var lower := bone_name.to_lower()
-	for frag in SKIP_BONE_FRAGMENTS:
-		if lower.contains(frag):
-			return true
-	# Keep only Spine2 from the trunk chain.  Spine and Spine1 capsules overlap
-	# Spine2 (they're ~17 cm apart with 10 cm radius each) and have no exception
-	# between them — the solver explodes on the first contact.
-	if bone_name.ends_with("Spine") or bone_name.ends_with("Spine1"):
-		return true
-	return false
-
-
-func _estimate_bone_length(skeleton: Skeleton3D, bone_idx: int) -> float:
-	# For bones with multiple children (e.g. Hips → Spine + LeftUpLeg + RightUpLeg)
-	# using the first child in index order gives the wrong length.  Take the LONGEST
-	# child distance so branching bones get a capsule that covers their widest extent.
-	var my_global := skeleton.get_bone_global_rest(bone_idx)
-	var best := 0.0
-	for j in skeleton.get_bone_count():
-		if skeleton.get_bone_parent(j) == bone_idx:
-			var d := my_global.origin.distance_to(skeleton.get_bone_global_rest(j).origin)
-			if d > best:
-				best = d
-	if best > 0.0:
-		return best
-	var parent := skeleton.get_bone_parent(bone_idx)
-	if parent >= 0:
-		return my_global.origin.distance_to(skeleton.get_bone_global_rest(parent).origin) * 0.5
-	return 0.15
-
-
-func _apply_joint_limits(pb: PhysicalBone3D, bone_name: String) -> void:
-	# With the corrected joint frame (cone Z = bone extension direction):
-	#   swing_span = max angle the bone can deviate from its rest direction → flexion
-	#   twist_span = max rotation around the bone's own axis → spin
-	var swing := 30.0
-	var twist := 20.0
-	var bname := bone_name
-	if   bname.ends_with("Hips"):
-		swing = 20.0;  twist = 15.0   # root: small tilt, small twist
-	elif bname.ends_with("Spine2"):
-		swing = 30.0;  twist = 20.0   # trunk: moderate flex + twist
-	elif bname.ends_with("Head"):
-		swing = 40.0;  twist = 30.0   # head: nod/tilt + turn
-	elif bname.ends_with("LeftArm") or bname.ends_with("RightArm"):
-		swing = 80.0;  twist = 90.0   # shoulder socket: large flex, large spin
-	elif bname.ends_with("LeftForeArm") or bname.ends_with("RightForeArm"):
-		swing = 130.0; twist = 20.0   # elbow: large flex (swing), minimal spin
-	elif bname.ends_with("LeftUpLeg") or bname.ends_with("RightUpLeg"):
-		swing = 50.0;  twist = 30.0   # hip socket: generous flex + some rotation
-	elif bname.ends_with("LeftLeg") or bname.ends_with("RightLeg"):
-		swing = 140.0; twist = 10.0   # knee: full flex (swing), almost no spin
-
-	pb.set("joint_constraints/swing_span", swing)
-	pb.set("joint_constraints/twist_span", twist)
-	pb.set("joint_constraints/bias",       0.3)
-	pb.set("joint_constraints/softness",   0.8)
-	pb.set("joint_constraints/relaxation", 1.0)
-
-
 func _apply_bone_profile(pb: PhysicalBone3D, bone_name: String) -> void:
-	# Default — overridden per region below.
 	pb.mass         = 1.0
 	pb.linear_damp  = 1.5
 	pb.angular_damp = 8.0
-	var bname := bone_name
-	if   bname.ends_with("Hips"):
+	if   bone_name.ends_with("Hips"):
 		pb.mass = 20.0; pb.linear_damp = 2.0; pb.angular_damp = 30.0
-	elif bname.ends_with("Spine") or bname.ends_with("Spine1"):
+	elif bone_name.ends_with("Spine") or bone_name.ends_with("Spine1"):
 		pb.mass = 5.0;  pb.linear_damp = 2.0; pb.angular_damp = 20.0
-	elif bname.ends_with("Spine2"):
+	elif bone_name.ends_with("Spine2"):
 		pb.mass = 4.0;  pb.linear_damp = 2.0; pb.angular_damp = 20.0
-	elif bname.ends_with("Neck"):
+	elif bone_name.ends_with("Neck"):
 		pb.mass = 1.5;  pb.angular_damp = 24.0
-	elif bname.ends_with("Head"):
+	elif bone_name.ends_with("Head"):
 		pb.mass = 5.0;  pb.angular_damp = 24.0
-	elif bname.ends_with("LeftShoulder") or bname.ends_with("RightShoulder"):
+	elif bone_name.ends_with("LeftShoulder") or bone_name.ends_with("RightShoulder"):
 		pb.mass = 1.5
-	elif bname.ends_with("LeftArm") or bname.ends_with("RightArm"):
+	elif bone_name.ends_with("LeftArm") or bone_name.ends_with("RightArm"):
 		pb.mass = 2.0
-	elif bname.ends_with("LeftForeArm") or bname.ends_with("RightForeArm"):
+	elif bone_name.ends_with("LeftForeArm") or bone_name.ends_with("RightForeArm"):
 		pb.mass = 1.2;  pb.angular_damp = 10.0
-	elif bname.ends_with("LeftHand") or bname.ends_with("RightHand"):
+	elif bone_name.ends_with("LeftHand") or bone_name.ends_with("RightHand"):
 		pb.mass = 0.4;  pb.linear_damp = 3.0; pb.angular_damp = 12.0
-	elif bname.ends_with("LeftUpLeg") or bname.ends_with("RightUpLeg"):
+	elif bone_name.ends_with("LeftUpLeg") or bone_name.ends_with("RightUpLeg"):
 		pb.mass = 8.0;  pb.angular_damp = 10.0
-	elif bname.ends_with("LeftLeg") or bname.ends_with("RightLeg"):
+	elif bone_name.ends_with("LeftLeg") or bone_name.ends_with("RightLeg"):
 		pb.mass = 4.0
-	elif bname.ends_with("LeftFoot") or bname.ends_with("RightFoot"):
+	elif bone_name.ends_with("LeftFoot") or bone_name.ends_with("RightFoot"):
 		pb.mass = 1.2;  pb.linear_damp = 3.0; pb.angular_damp = 12.0
 	else:
 		pb.mass = 0.5;  pb.linear_damp = 3.0; pb.angular_damp = 15.0
